@@ -140,44 +140,62 @@ find_php_config() {
   return 1
 }
 
-# Resolve target php.ini / conf.d drop-in path
-resolve_ini_target() {
-  local php_bin="$1"
-  local ini_out loaded scan
-  ini_out="$("$php_bin" --ini 2>/dev/null || true)"
-  loaded="$(printf '%s\n' "$ini_out" | awk -F': *' '/^Loaded Configuration File/{print $2}' | tr -d '\r' | sed 's/[[:space:]]*$//')"
-  scan="$(printf '%s\n' "$ini_out" | awk -F': *' '/^Scan for additional .ini files in/{print $2}' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+# Strip whitespace / surrounding quotes from php --ini paths
+normalize_ini_path() {
+  local p="$1"
+  p="$(printf '%s' "$p" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^"+//; s/"+$//; s/^'\''+//; s/'\''+$//')"
+  printf '%s' "$p"
+}
 
-  # Prefer conf.d / php.d drop-in when scan dir exists (Baota, Debian, etc.)
-  if [[ -n "$scan" && "$scan" != "(none)" && "$scan" != "none" ]]; then
-    if [[ -d "$scan" ]] || mkdir -p "$scan" 2>/dev/null; then
-      echo "${scan%/}/99-core_loader.ini"
-      return 0
-    fi
-    # try with sudo later — still return intended path
-    echo "${scan%/}/99-core_loader.ini"
-    return 0
-  fi
+# Print one or more ini targets (newline-separated). Prefer php.d drop-in.
+resolve_ini_targets() {
+  local php_bin="$1"
+  local ini_out loaded scan etc_dir major minor compact
+  local -a targets=()
+  ini_out="$("$php_bin" --ini 2>/dev/null || true)"
+  loaded="$(normalize_ini_path "$(printf '%s\n' "$ini_out" | awk -F': *' '/Loaded Configuration File/{print $2; exit}')")"
+  scan="$(normalize_ini_path "$(printf '%s\n' "$ini_out" | awk -F': *' '/Scan for additional .ini files in/{print $2; exit}')")"
+
+  major="${PHP_VER%%.*}"
+  minor="${PHP_VER#*.}"
+  compact="${major}${minor}"
 
   if [[ -n "$loaded" && "$loaded" != "(none)" && "$loaded" != "none" ]]; then
-    echo "$loaded"
-    return 0
+    etc_dir="$(dirname "$loaded")"
+  else
+    etc_dir=""
   fi
 
-  # Baota fallback by version
-  local major="${PHP_VER%%.*}"
-  local minor="${PHP_VER#*.}"
-  local compact="${major}${minor}"
-  for p in \
-    "/www/server/php/${compact}/etc/php.ini" \
-    "/www/server/php/${PHP_VER}/etc/php.ini"
-  do
-    if [[ -f "$p" ]]; then
-      echo "$p"
-      return 0
+  # 1) Prefer conf.d / php.d drop-in (CLI + FPM when both scan it)
+  if [[ -n "$scan" && "$scan" != "(none)" && "$scan" != "none" ]]; then
+    targets+=("${scan%/}/99-core_loader.ini")
+  elif [[ -n "$etc_dir" && -d "${etc_dir}/php.d" ]]; then
+    targets+=("${etc_dir}/php.d/99-core_loader.ini")
+  elif [[ -d "/www/server/php/${compact}/etc/php.d" ]]; then
+    targets+=("/www/server/php/${compact}/etc/php.d/99-core_loader.ini")
+  fi
+
+  # 2) No drop-in: write web php.ini (and php-cli.ini), never quotes-wrapped paths
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    if [[ -f "/www/server/php/${compact}/etc/php.ini" ]]; then
+      targets+=("/www/server/php/${compact}/etc/php.ini")
+      [[ -f "/www/server/php/${compact}/etc/php-cli.ini" ]] && targets+=("/www/server/php/${compact}/etc/php-cli.ini")
+    elif [[ -n "$loaded" && "$loaded" != "(none)" && "$loaded" != "none" ]]; then
+      if [[ "$(basename "$loaded")" == "php-cli.ini" && -f "${etc_dir}/php.ini" ]]; then
+        targets+=("${etc_dir}/php.ini" "$loaded")
+      else
+        targets+=("$loaded")
+        if [[ "$(basename "$loaded")" == "php.ini" && -f "${etc_dir}/php-cli.ini" ]]; then
+          targets+=("${etc_dir}/php-cli.ini")
+        fi
+      fi
     fi
-  done
-  return 1
+  fi
+
+  if [[ ${#targets[@]} -eq 0 ]]; then
+    return 1
+  fi
+  printf '%s\n' "${targets[@]}"
 }
 
 write_file() {
@@ -294,10 +312,18 @@ if [[ -z "$INSTALL_DIR" || "$INSTALL_DIR" == "." ]]; then
   exit 1
 fi
 
-if [[ "$NO_INI" -eq 0 && -z "$INI_FILE" ]]; then
-  if ! INI_FILE="$(resolve_ini_target "$PHP_BIN")"; then
-    echo "Warning: could not detect php.ini; skip auto config (pass --ini PATH)" >&2
-    NO_INI=1
+INI_TARGETS=()
+if [[ "$NO_INI" -eq 0 ]]; then
+  if [[ -n "$INI_FILE" ]]; then
+    INI_TARGETS+=("$(normalize_ini_path "$INI_FILE")")
+  else
+    while IFS= read -r _ini; do
+      [[ -n "$_ini" ]] && INI_TARGETS+=("$_ini")
+    done < <(resolve_ini_targets "$PHP_BIN" || true)
+    if [[ ${#INI_TARGETS[@]} -eq 0 ]]; then
+      echo "Warning: could not detect php.ini; skip auto config (pass --ini PATH)" >&2
+      NO_INI=1
+    fi
   fi
 fi
 
@@ -321,7 +347,7 @@ echo "  Asset:   ${ASSET}"
 echo "  From:    ${URL}"
 echo "  To:      ${DEST}"
 if [[ "$NO_INI" -eq 0 ]]; then
-  echo "  Ini:     ${INI_FILE}"
+  echo "  Ini:     ${INI_TARGETS[*]}"
 else
   echo "  Ini:     (skipped)"
 fi
@@ -398,7 +424,16 @@ echo "Installed: ${DEST}"
 
 if [[ "$NO_INI" -eq 0 ]]; then
   echo "Configuring PHP..."
-  append_or_create_ini "$INI_FILE" "$INI_LINE"
+  _ini_fail=0
+  for _ini in "${INI_TARGETS[@]}"; do
+    if ! append_or_create_ini "$_ini" "$INI_LINE"; then
+      _ini_fail=1
+    fi
+  done
+  if [[ "$_ini_fail" -ne 0 ]]; then
+    echo "Error: failed to update one or more ini files" >&2
+    exit 1
+  fi
 fi
 
 echo ""
