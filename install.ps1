@@ -11,6 +11,7 @@ param(
   [string]$Dir = "",
   [string]$Ini = "",
   [switch]$NoIni,
+  [switch]$NoReload,
   [switch]$DryRun,
   [switch]$Force
 )
@@ -32,6 +33,11 @@ function Get-WinArch {
   return "x86"
 }
 
+function Normalize-IniPath([string]$p) {
+  if (-not $p) { return $p }
+  return ($p.Trim().Trim('"').Trim("'"))
+}
+
 function Get-ExtensionDir([string]$bin) {
   if ($Dir) { return $Dir }
   $ext = & $bin -r "echo ini_get('extension_dir');" 2>$null
@@ -41,22 +47,40 @@ function Get-ExtensionDir([string]$bin) {
   throw "Could not detect extension_dir; pass -Dir"
 }
 
-function Get-IniTarget([string]$bin) {
-  if ($Ini) { return $Ini }
+function Get-IniTargets([string]$bin) {
+  if ($Ini) { return @((Normalize-IniPath $Ini)) }
   $iniOut = & $bin --ini 2>$null | Out-String
   $loaded = $null
   $scan = $null
   foreach ($line in ($iniOut -split "`n")) {
-    if ($line -match '^Loaded Configuration File:\s*(.+)$') { $loaded = $Matches[1].Trim() }
-    if ($line -match '^Scan for additional \.ini files in:\s*(.+)$') { $scan = $Matches[1].Trim() }
+    if ($line -match 'Loaded Configuration File:\s*(.+)$') {
+      $loaded = Normalize-IniPath $Matches[1]
+    }
+    if ($line -match 'Scan for additional \.ini files in:\s*(.+)$') {
+      $scan = Normalize-IniPath $Matches[1]
+    }
   }
+  $targets = New-Object System.Collections.Generic.List[string]
   if ($scan -and $scan -ne '(none)' -and $scan -ne 'none') {
-    return (Join-Path $scan '99-core_loader.ini')
+    $targets.Add((Join-Path $scan '99-core_loader.ini')) | Out-Null
+  } elseif ($loaded -and $loaded -ne '(none)' -and $loaded -ne 'none') {
+    $etc = Split-Path -Parent $loaded
+    $phpIni = Join-Path $etc 'php.ini'
+    $cliIni = Join-Path $etc 'php-cli.ini'
+    if ((Split-Path -Leaf $loaded) -eq 'php-cli.ini' -and (Test-Path $phpIni)) {
+      $targets.Add($phpIni) | Out-Null
+      $targets.Add($loaded) | Out-Null
+    } else {
+      $targets.Add($loaded) | Out-Null
+      if ((Split-Path -Leaf $loaded) -eq 'php.ini' -and (Test-Path $cliIni)) {
+        $targets.Add($cliIni) | Out-Null
+      }
+    }
   }
-  if ($loaded -and $loaded -ne '(none)' -and $loaded -ne 'none') {
-    return $loaded
+  if ($targets.Count -eq 0) {
+    throw "Could not detect php.ini; pass -Ini"
   }
-  throw "Could not detect php.ini; pass -Ini"
+  return $targets.ToArray()
 }
 
 function Update-PhpIni([string]$path, [string]$line, [string]$comment) {
@@ -94,6 +118,111 @@ function Update-PhpIni([string]$path, [string]$line, [string]$comment) {
   Write-Host "  ini: updated $path"
 }
 
+function Get-DownloadUrls([string]$primary) {
+  return @(
+    $primary,
+    "https://ghfast.top/$primary",
+    "https://mirror.ghproxy.com/$primary",
+    "https://ghproxy.net/$primary",
+    "https://gitdl.cn/$primary"
+  )
+}
+
+function Download-Asset([string]$dest, [string[]]$urls) {
+  Write-Host "Downloading:"
+  $i = 0
+  foreach ($u in $urls) {
+    $i++
+    try {
+      # Progress shown by Invoke-WebRequest in interactive hosts
+      Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing -TimeoutSec 180
+      if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) {
+        return
+      }
+    } catch {
+      # try next mirror silently
+    }
+  }
+  throw "Download failed for all mirrors"
+}
+
+function Restart-PhpRuntime([string]$phpVer) {
+  Write-Host "Reloading PHP runtime..."
+  $compact = ($phpVer -replace '\.', '')
+  $ok = $false
+
+  # IIS
+  try {
+    if (Get-Command iisreset -ErrorAction SilentlyContinue) {
+      & iisreset /noforce 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) {
+        Write-Host "  reloaded via iisreset"
+        return
+      }
+    }
+  } catch {}
+
+  try {
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    if (Get-Command Restart-WebAppPool -ErrorAction SilentlyContinue) {
+      Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue | ForEach-Object {
+        Restart-WebAppPool $_.Name -ErrorAction SilentlyContinue
+        $ok = $true
+      }
+      if ($ok) {
+        Write-Host "  restarted IIS app pools"
+        return
+      }
+    }
+  } catch {}
+
+  # Windows services commonly used by panels / phpstudy / custom NSSM
+  $serviceNames = @(
+    "php-fpm-$compact",
+    "php-fpm$compact",
+    "php$compact-fpm",
+    "php$phpVer-fpm",
+    "php-cgi-$compact",
+    "php-cgi",
+    "php-fpm",
+    "w3svc",
+    "Apache2.4",
+    "Apache2.2",
+    "nginx"
+  )
+  foreach ($name in $serviceNames) {
+    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+    if ($null -eq $svc) { continue }
+    try {
+      Restart-Service -Name $name -Force -ErrorAction Stop
+      Write-Host "  restarted service $name"
+      return
+    } catch {}
+  }
+
+  # Docker Desktop / Windows containers (1Panel-like / compose)
+  if (Get-Command docker -ErrorAction SilentlyContinue) {
+    $rows = docker ps --format "{{.ID}} {{.Names}} {{.Image}}" 2>$null
+    if ($rows) {
+      $matched = $rows | Where-Object { $_ -match 'php|fpm|1panel' -and $_ -match "$phpVer|$compact" }
+      if (-not $matched) {
+        $matched = $rows | Where-Object { $_ -match 'php.*fpm|fpm.*php|1panel.*php' }
+      }
+      foreach ($row in $matched) {
+        $id = ($row -split '\s+')[0]
+        $name = ($row -split '\s+')[1]
+        try {
+          docker restart $id 2>$null | Out-Null
+          Write-Host "  restarted docker container $name"
+          return
+        } catch {}
+      }
+    }
+  }
+
+  Write-Host "  warning: could not auto-reload PHP runtime; restart IIS/service/container manually if needed"
+}
+
 if (-not $PhpBin) { $PhpBin = "php" }
 if (-not $Php) { $Php = Get-PhpVersionFromBin $PhpBin }
 
@@ -113,15 +242,15 @@ if ($Version -ne "latest") {
   $productVer = $Version.TrimStart('v')
 } else {
   try {
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$Repo/releases/latest" -UseBasicParsing
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 15
     if ($rel.tag_name) { $productVer = $rel.tag_name.TrimStart('v') }
   } catch {}
 }
 $iniComment = "; Core Loader $productVer"
 
-$iniPath = $null
+$iniPaths = @()
 if (-not $NoIni) {
-  $iniPath = Get-IniTarget $PhpBin
+  $iniPaths = Get-IniTargets $PhpBin
 }
 
 if ($Version -eq "latest") {
@@ -142,7 +271,7 @@ Write-Host "  To:      $dest"
 if ($NoIni) {
   Write-Host "  Ini:     (skipped)"
 } else {
-  Write-Host "  Ini:     $iniPath"
+  Write-Host "  Ini:     $($iniPaths -join ' ')"
 }
 
 if ($DryRun) {
@@ -150,11 +279,10 @@ if ($DryRun) {
   exit 0
 }
 
-# Always overwrite existing extension
-
 $tmp = Join-Path $env:TEMP ("core_loader_" + [guid]::NewGuid().ToString() + ".dll")
 try {
-  Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+  Download-Asset -dest $tmp -urls (Get-DownloadUrls $url)
+
   $fs = [System.IO.File]::OpenRead($tmp)
   try {
     $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
@@ -179,10 +307,16 @@ Write-Host "Installed: $dest"
 
 if (-not $NoIni) {
   Write-Host "Configuring PHP..."
-  Update-PhpIni -path $iniPath -line $iniLine -comment $iniComment
+  foreach ($p in $iniPaths) {
+    Update-PhpIni -path $p -line $iniLine -comment $iniComment
+  }
+}
+
+if (-not $NoReload) {
+  Restart-PhpRuntime -phpVer $Php
 }
 
 Write-Host ""
-Write-Host "Verify:"
+Write-Host "Done. Verify:"
 Write-Host "  $PhpBin -m | findstr core_loader"
 Write-Host "  $PhpBin -r `"var_export(extension_loaded('core_loader')); echo PHP_EOL;`""
