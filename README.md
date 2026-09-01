@@ -22,6 +22,12 @@ curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash -s -- 8
 irm https://coreloader.com/core-loader-releases/install.ps1 | iex
 ```
 
+指定 PHP 版本：
+
+```powershell
+iex "& { $(irm https://coreloader.com/core-loader-releases/install.ps1) } -Php 8.5"
+```
+
 脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
 
 ## 验证
