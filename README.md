@@ -28,7 +28,7 @@ cmd /c "curl -fsSL -o %TEMP%\cl-install.cmd https://coreloader.com/core-loader-r
 cmd /c "curl -fsSL -o %TEMP%\cl-install.cmd https://coreloader.com/core-loader-releases/install.cmd && call %TEMP%\cl-install.cmd 8.5"
 ```
 
-### 脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
+#### 脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
 
 ## 验证
 
