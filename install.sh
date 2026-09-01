@@ -36,7 +36,7 @@ Options:
   --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
   --no-ini           Do not modify php.ini / conf.d
   --dry-run          Print actions only
-  --force            Overwrite existing core_loader.so
+  --force            Accepted for compatibility (always overwrites)
   -h, --help         Show help
 EOF
 }
@@ -357,13 +357,8 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ -f "$DEST" && "$FORCE" -ne 1 ]]; then
-  echo "Extension already exists: ${DEST}"
-  echo "  (skip download; use --force to overwrite the .so)"
-  SKIP_DOWNLOAD=1
-else
-  SKIP_DOWNLOAD=0
-fi
+# Always (re)download and overwrite existing extension
+SKIP_DOWNLOAD=0
 
 if [[ "$SKIP_DOWNLOAD" -eq 0 ]]; then
   if ! curl -fsSL -o "$TMP" "$URL"; then
