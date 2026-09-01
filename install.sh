@@ -3,7 +3,7 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/coreloader/coreloader/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --version v8.0.0
-#   ./install.sh --php 8.3 --dir /usr/lib/php/modules
+#   ./install.sh --php 8.3 --dir /www/server/php/83/lib/php/extensions/...
 set -euo pipefail
 
 # Defaults — https://github.com/coreloader/coreloader
@@ -15,7 +15,10 @@ OWNER="$DEFAULT_OWNER"
 REPO="$DEFAULT_REPO"
 VERSION="$DEFAULT_VERSION"
 PHP_VER=""
+PHP_BIN=""
 INSTALL_DIR=""
+INI_FILE=""
+NO_INI=0
 DRY_RUN=0
 FORCE=0
 
@@ -28,7 +31,10 @@ Options:
   --repo NAME        GitHub repo  (default: $DEFAULT_REPO)
   --version TAG      Release tag or "latest" (default: $DEFAULT_VERSION)
   --php X.Y          PHP major.minor (default: detect from php)
+  --php-bin PATH     PHP binary to use (default: auto-detect)
   --dir PATH         Extension install directory (default: php-config --extension-dir)
+  --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
+  --no-ini           Do not modify php.ini / conf.d
   --dry-run          Print actions only
   --force            Overwrite existing core_loader.so
   -h, --help         Show help
@@ -41,7 +47,10 @@ while [[ $# -gt 0 ]]; do
     --repo) REPO="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --php) PHP_VER="$2"; shift 2 ;;
+    --php-bin) PHP_BIN="$2"; shift 2 ;;
     --dir) INSTALL_DIR="$2"; shift 2 ;;
+    --ini) INI_FILE="$2"; shift 2 ;;
+    --no-ini) NO_INI=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -68,7 +77,6 @@ need_cmd() {
 }
 
 need_cmd curl
-need_cmd php
 
 detect_os() {
   case "$(uname -s)" in
@@ -86,32 +94,198 @@ detect_arch() {
   esac
 }
 
-detect_php() {
-  php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;'
+# Prefer Baota / common multi-PHP layouts when --php is given
+find_php_bin() {
+  local ver="$1"
+  local major="${ver%%.*}"
+  local minor="${ver#*.}"
+  local compact="${major}${minor}"   # 85
+  local candidates=(
+    "/www/server/php/${compact}/bin/php"
+    "/www/server/php/${ver}/bin/php"
+    "/usr/bin/php${ver}"
+    "/usr/local/bin/php${ver}"
+    "/opt/homebrew/opt/php@${ver}/bin/php"
+    "/usr/local/opt/php@${ver}/bin/php"
+  )
+
+  if command -v php >/dev/null 2>&1; then
+    candidates+=("$(command -v php)")
+  fi
+
+  local c got
+  for c in "${candidates[@]}"; do
+    [[ -x "$c" ]] || continue
+    got="$("$c" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+    if [[ "$got" == "$ver" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_php_config() {
+  local php_bin="$1"
+  local bindir
+  bindir="$(dirname "$php_bin")"
+  if [[ -x "${bindir}/php-config" ]]; then
+    echo "${bindir}/php-config"
+    return 0
+  fi
+  if command -v php-config >/dev/null 2>&1; then
+    echo "$(command -v php-config)"
+    return 0
+  fi
+  return 1
+}
+
+# Resolve target php.ini / conf.d drop-in path
+resolve_ini_target() {
+  local php_bin="$1"
+  local ini_out loaded scan
+  ini_out="$("$php_bin" --ini 2>/dev/null || true)"
+  loaded="$(printf '%s\n' "$ini_out" | awk -F': *' '/^Loaded Configuration File/{print $2}' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+  scan="$(printf '%s\n' "$ini_out" | awk -F': *' '/^Scan for additional .ini files in/{print $2}' | tr -d '\r' | sed 's/[[:space:]]*$//')"
+
+  # Prefer conf.d / php.d drop-in when scan dir exists (Baota, Debian, etc.)
+  if [[ -n "$scan" && "$scan" != "(none)" && "$scan" != "none" ]]; then
+    if [[ -d "$scan" ]] || mkdir -p "$scan" 2>/dev/null; then
+      echo "${scan%/}/99-core_loader.ini"
+      return 0
+    fi
+    # try with sudo later — still return intended path
+    echo "${scan%/}/99-core_loader.ini"
+    return 0
+  fi
+
+  if [[ -n "$loaded" && "$loaded" != "(none)" && "$loaded" != "none" ]]; then
+    echo "$loaded"
+    return 0
+  fi
+
+  # Baota fallback by version
+  local major="${PHP_VER%%.*}"
+  local minor="${PHP_VER#*.}"
+  local compact="${major}${minor}"
+  for p in \
+    "/www/server/php/${compact}/etc/php.ini" \
+    "/www/server/php/${PHP_VER}/etc/php.ini"
+  do
+    if [[ -f "$p" ]]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_file() {
+  local path="$1"
+  local content="$2"
+  local dir
+  dir="$(dirname "$path")"
+  if mkdir -p "$dir" 2>/dev/null && printf '%s' "$content" >"$path" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo mkdir -p "$dir"
+    printf '%s' "$content" | sudo tee "$path" >/dev/null
+    return 0
+  fi
+  return 1
+}
+
+append_or_create_ini() {
+  local path="$1"
+  local line="$2"
+  local tmp content
+
+  if [[ -f "$path" ]] && grep -Eq "^[[:space:]]*extension[[:space:]]*=[[:space:]]*(core_loader\\.so|${DEST_NAME})([[:space:]]|;|$)" "$path" 2>/dev/null; then
+    echo "  ini: already enabled in ${path}"
+    return 0
+  fi
+
+  # Drop-in file: overwrite with clean content
+  if [[ "$(basename "$path")" == "99-core_loader.ini" ]]; then
+    content="; Generated by coreloader install.sh — do not use zend_extension=
+${line}
+"
+    if write_file "$path" "$content"; then
+      echo "  ini: wrote ${path}"
+      return 0
+    fi
+    echo "Error: cannot write ${path}" >&2
+    return 1
+  fi
+
+  # Main php.ini: append if missing; comment out mistaken zend_extension=
+  tmp="$(mktemp)"
+  if [[ -f "$path" ]]; then
+    # shellcheck disable=SC2016
+    sed -E \
+      -e 's/^([[:space:]]*)zend_extension[[:space:]]*=[[:space:]]*.*core_loader.*/;\1 disabled by coreloader install (use extension=)/' \
+      "$path" >"$tmp" || cp "$path" "$tmp"
+    if ! grep -Eq "^[[:space:]]*extension[[:space:]]*=[[:space:]]*(core_loader\\.so|${DEST_NAME})([[:space:]]|;|$)" "$tmp"; then
+      printf '\n; Core Loader (auto)\n%s\n' "$line" >>"$tmp"
+    fi
+  else
+    printf '; Core Loader (auto)\n%s\n' "$line" >"$tmp"
+  fi
+
+  if cp "$tmp" "$path" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "  ini: updated ${path}"
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo cp "$tmp" "$path"; then
+    rm -f "$tmp"
+    echo "  ini: updated ${path} (sudo)"
+    return 0
+  fi
+  rm -f "$tmp"
+  echo "Error: cannot update ${path}" >&2
+  return 1
 }
 
 OS="$(detect_os)"
 ARCH="$(detect_arch)"
+
+USER_PHP_BIN="$PHP_BIN"
+
 if [[ -z "$PHP_VER" ]]; then
-  PHP_VER="$(detect_php)"
+  need_cmd php
+  PHP_VER="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
 fi
 
 case "$PHP_VER" in
   7.0|7.1|7.2|7.3|7.4|8.0|8.1|8.2|8.3|8.4|8.5) ;;
   *)
     echo "Error: unsupported PHP version '$PHP_VER' (supported: 7.0–8.5)" >&2
+    echo "Hint: --version is the GitHub Release tag (e.g. v8.0.0); use --php 8.3 for PHP version." >&2
     exit 1
     ;;
 esac
 
+if [[ -n "$USER_PHP_BIN" ]]; then
+  PHP_BIN="$USER_PHP_BIN"
+  [[ -x "$PHP_BIN" ]] || { echo "Error: --php-bin not executable: $PHP_BIN" >&2; exit 1; }
+else
+  if ! PHP_BIN="$(find_php_bin "$PHP_VER")"; then
+    echo "Error: PHP ${PHP_VER} binary not found. Pass --php-bin /path/to/php" >&2
+    exit 1
+  fi
+fi
+
 ASSET="core_loader-php${PHP_VER}-${OS}-${ARCH}.so"
 DEST_NAME="core_loader.so"
+INI_LINE="extension=${DEST_NAME}"
 
 if [[ -z "$INSTALL_DIR" ]]; then
-  if command -v php-config >/dev/null 2>&1; then
-    INSTALL_DIR="$(php-config --extension-dir)"
+  if PHP_CONFIG="$(find_php_config "$PHP_BIN" 2>/dev/null)"; then
+    INSTALL_DIR="$("$PHP_CONFIG" --extension-dir)"
   else
-    INSTALL_DIR="$(php -r 'echo ini_get("extension_dir");')"
+    INSTALL_DIR="$("$PHP_BIN" -r 'echo ini_get("extension_dir");' 2>/dev/null || true)"
   fi
 fi
 
@@ -120,10 +294,16 @@ if [[ -z "$INSTALL_DIR" || "$INSTALL_DIR" == "." ]]; then
   exit 1
 fi
 
+if [[ "$NO_INI" -eq 0 && -z "$INI_FILE" ]]; then
+  if ! INI_FILE="$(resolve_ini_target "$PHP_BIN")"; then
+    echo "Warning: could not detect php.ini; skip auto config (pass --ini PATH)" >&2
+    NO_INI=1
+  fi
+fi
+
 if [[ "$VERSION" == "latest" ]]; then
   URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/${ASSET}"
 else
-  # Accept v8.0.0 or 8.0.0
   TAG="$VERSION"
   [[ "$TAG" == v* ]] || TAG="v${TAG}"
   URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
@@ -135,14 +315,19 @@ cleanup() { rm -f "$TMP"; }
 trap cleanup EXIT
 
 echo "Core Loader install"
-echo "  PHP:     ${PHP_VER}"
+echo "  PHP:     ${PHP_VER} (${PHP_BIN})"
 echo "  OS/Arch: ${OS}-${ARCH}"
 echo "  Asset:   ${ASSET}"
 echo "  From:    ${URL}"
 echo "  To:      ${DEST}"
+if [[ "$NO_INI" -eq 0 ]]; then
+  echo "  Ini:     ${INI_FILE}"
+else
+  echo "  Ini:     (skipped)"
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[dry-run] skip download/install"
+  echo "[dry-run] skip download/install/ini"
   exit 0
 fi
 
@@ -162,7 +347,6 @@ if [[ ! -s "$TMP" ]]; then
   exit 1
 fi
 
-# Basic ELF / Mach-O sanity
 magic="$(xxd -l 4 -p "$TMP" 2>/dev/null || od -An -tx1 -N4 "$TMP" | tr -d ' \n')"
 magic="$(echo "$magic" | tr -d ' \n')"
 case "$OS" in
@@ -173,7 +357,6 @@ case "$OS" in
     fi
     ;;
   darwin)
-    # Mach-O 64-bit: cffaedfe (LE) / feedfacf (BE) ; universal: cafebabe
     case "$magic" in
       cffaedfe|feedfacf|cafebabe|befaceca) ;;
       *)
@@ -187,12 +370,7 @@ esac
 mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 if ! cp -f "$TMP" "$DEST" 2>/dev/null; then
   echo "Permission denied writing ${DEST}"
-  echo "Retry with sudo, or install to a writable directory:"
-  echo "  curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh | bash -s -- --dir \"\$HOME/php-ext\" --force"
-  echo "  # then in php.ini:"
-  echo "  # extension=\$HOME/php-ext/core_loader.so"
   if [[ -t 0 ]]; then
-    echo ""
     read -r -p "Retry with sudo? [y/N] " ans || true
     if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
       sudo mkdir -p "$INSTALL_DIR"
@@ -201,26 +379,30 @@ if ! cp -f "$TMP" "$DEST" 2>/dev/null; then
       exit 1
     fi
   else
-    # non-interactive (curl | bash): try sudo -n
-    if sudo -n true 2>/dev/null; then
-      sudo mkdir -p "$INSTALL_DIR"
-      sudo cp -f "$TMP" "$DEST"
+    if sudo -n true 2>/dev/null || [[ "$(id -u)" -eq 0 ]]; then
+      sudo mkdir -p "$INSTALL_DIR" 2>/dev/null || mkdir -p "$INSTALL_DIR"
+      if [[ "$(id -u)" -eq 0 ]]; then
+        cp -f "$TMP" "$DEST"
+      else
+        sudo cp -f "$TMP" "$DEST"
+      fi
     else
+      echo "Error: need root/sudo to write ${DEST}" >&2
       exit 1
     fi
   fi
 fi
 
 chmod 755 "$DEST" 2>/dev/null || sudo chmod 755 "$DEST" 2>/dev/null || true
+echo "Installed: ${DEST}"
+
+if [[ "$NO_INI" -eq 0 ]]; then
+  echo "Configuring PHP..."
+  append_or_create_ini "$INI_FILE" "$INI_LINE"
+fi
 
 echo ""
-echo "Installed: ${DEST}"
-echo ""
-echo "Add to php.ini (use extension=, NOT zend_extension=):"
-echo "  extension=${DEST_NAME}"
-echo "  # or absolute path:"
-echo "  # extension=${DEST}"
-echo ""
 echo "Verify:"
-echo "  php -m | grep core_loader"
-echo "  php -r 'var_export(extension_loaded(\"core_loader\")); echo PHP_EOL;'"
+echo "  ${PHP_BIN} -m | grep core_loader"
+echo "  ${PHP_BIN} -r 'var_export(extension_loaded(\"core_loader\")); echo PHP_EOL;'"
+echo "Reload PHP-FPM if needed (Baota: 软件商店 → PHP ${PHP_VER} → 服务 → 重载)."
