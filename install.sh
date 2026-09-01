@@ -2,8 +2,9 @@
 # Core Loader — one-click install (Linux / macOS)
 # Usage:
 #   curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- --php 8.5
-#   ./install.sh --php 8.3 --dir /www/server/php/83/lib/php/extensions/...
+#   curl -fsSL .../install.sh | bash -s -- 8.5
+#   curl -fsSL .../install.sh | bash -s -- -php 8.5
+#   ./install.sh -php 8.3 --dir /www/server/php/83/lib/php/extensions/...
 set -euo pipefail
 
 # Defaults — primary: https://coreloader.com ; backup: GitHub Releases
@@ -35,12 +36,19 @@ FALLBACK_SET=0
 [[ -n "$DEFAULT_FALLBACK" ]] && FALLBACK_SET=1
 
 usage() {
-  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
+Core Loader — one-click install (Linux / macOS)
+
+Usage:
+  curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
+  curl -fsSL .../install.sh | bash -s -- 8.5
+  curl -fsSL .../install.sh | bash -s -- -php 8.5
+  ./install.sh -php 8.3
 
 Options:
+  -php, --php X.Y    PHP major.minor (default: detect from php)
+  X.Y                Same as -php X.Y (positional)
   --version X.Y.Z    Product version for ini comment (default: $DEFAULT_VERSION)
-  --php X.Y          PHP major.minor (default: detect from php)
   --php-bin PATH     PHP binary to use (default: auto-detect)
   --dir PATH         Extension install directory (default: php-config --extension-dir)
   --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
@@ -60,7 +68,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
-    --php) PHP_VER="$2"; shift 2 ;;
+    -php|--php) PHP_VER="$2"; shift 2 ;;
     --php-bin) PHP_BIN="$2"; shift 2 ;;
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --ini) INI_FILE="$2"; shift 2 ;;
@@ -74,6 +82,14 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
+    # Bare PHP version: 8.5 / 7.4
+    [0-9].[0-9]|[0-9].[0-9][0-9])
+      if [[ -n "$PHP_VER" ]]; then
+        echo "Error: PHP version already set to ${PHP_VER}; unexpected: $1" >&2
+        exit 1
+      fi
+      PHP_VER="$1"; shift
+      ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
