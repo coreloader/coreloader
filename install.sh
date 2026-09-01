@@ -19,6 +19,7 @@ PHP_BIN=""
 INSTALL_DIR=""
 INI_FILE=""
 NO_INI=0
+NO_RELOAD=0
 DRY_RUN=0
 FORCE=0
 
@@ -35,6 +36,7 @@ Options:
   --dir PATH         Extension install directory (default: php-config --extension-dir)
   --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
   --no-ini           Do not modify php.ini / conf.d
+  --no-reload        Do not reload PHP-FPM after install
   --dry-run          Print actions only
   --force            Accepted for compatibility (always overwrites)
   -h, --help         Show help
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --ini) INI_FILE="$2"; shift 2 ;;
     --no-ini) NO_INI=1; shift ;;
+    --no-reload) NO_RELOAD=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -487,8 +490,99 @@ if [[ "$NO_INI" -eq 0 ]]; then
   fi
 fi
 
+run_cmd() {
+  # Run as root when needed
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@" >/dev/null 2>&1
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@" >/dev/null 2>&1
+  else
+    "$@" >/dev/null 2>&1
+  fi
+}
+
+reload_php_fpm() {
+  local ver="$1"
+  local major="${ver%%.*}"
+  local minor="${ver#*.}"
+  local compact="${major}${minor}"
+  local svc cmd
+
+  echo "Reloading PHP-FPM..."
+
+  # 1) Baota panel init scripts (most common on 宝塔)
+  for cmd in \
+    "/etc/init.d/php-fpm-${compact}" \
+    "/etc/init.d/php-fpm-${ver}" \
+    "/etc/init.d/php-fpm${compact}"
+  do
+    if [[ -x "$cmd" ]]; then
+      if run_cmd "$cmd" reload || run_cmd "$cmd" restart; then
+        echo "  reloaded via ${cmd}"
+        return 0
+      fi
+    fi
+  done
+
+  # 2) systemd unit names
+  if command -v systemctl >/dev/null 2>&1; then
+    for svc in \
+      "php-fpm-${compact}" \
+      "php-fpm${compact}" \
+      "php${compact}-fpm" \
+      "php${ver}-fpm" \
+      "php-fpm"
+    do
+      if run_cmd systemctl reload "$svc" || run_cmd systemctl restart "$svc"; then
+        echo "  reloaded via systemctl ${svc}"
+        return 0
+      fi
+    done
+  fi
+
+  # 3) service command
+  if command -v service >/dev/null 2>&1; then
+    for svc in "php-fpm-${compact}" "php${ver}-fpm" "php-fpm"; do
+      if run_cmd service "$svc" reload || run_cmd service "$svc" restart; then
+        echo "  reloaded via service ${svc}"
+        return 0
+      fi
+    done
+  fi
+
+  # 4) macOS Homebrew
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    if run_cmd brew services restart "php@${ver}" || run_cmd brew services restart php; then
+      echo "  restarted via brew services"
+      return 0
+    fi
+  fi
+
+  # 5) Baota: signal php-fpm master via pid if present
+  for pidf in \
+    "/www/server/php/${compact}/var/run/php-fpm.pid" \
+    "/www/server/php/${ver}/var/run/php-fpm.pid"
+  do
+    if [[ -f "$pidf" ]]; then
+      local pid
+      pid="$(tr -d ' \n' <"$pidf" 2>/dev/null || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if run_cmd kill -USR2 "$pid"; then
+          echo "  reloaded via USR2 pid ${pid}"
+          return 0
+        fi
+      fi
+    fi
+  done
+
+  echo "  warning: could not auto-reload PHP-FPM; reload manually if needed"
+  return 1
+}
+
+if [[ "$NO_RELOAD" -eq 0 ]]; then
+  reload_php_fpm "$PHP_VER" || true
+fi
+
 echo ""
-echo "Verify:"
+echo "Done. Verify:"
 echo "  ${PHP_BIN} -m | grep core_loader"
-echo "  ${PHP_BIN} -r 'var_export(extension_loaded(\"core_loader\")); echo PHP_EOL;'"
-echo "Reload PHP-FPM if needed (Baota: 软件商店 → PHP ${PHP_VER} → 服务 → 重载)."
