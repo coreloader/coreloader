@@ -1,0 +1,9 @@
+.DS_Store
+*.swp
+.vscode/
+.idea/
+*.so
+*.dll
+download/
+*.tmp
+*.log
