@@ -491,7 +491,6 @@ if [[ "$NO_INI" -eq 0 ]]; then
 fi
 
 run_cmd() {
-  # Run as root when needed
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@" >/dev/null 2>&1
   elif command -v sudo >/dev/null 2>&1; then
@@ -501,20 +500,82 @@ run_cmd() {
   fi
 }
 
+signal_fpm_pidfile() {
+  local pidf="$1"
+  local pid
+  [[ -f "$pidf" ]] || return 1
+  pid="$(tr -d ' \r\n' <"$pidf" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  if kill -0 "$pid" 2>/dev/null; then
+    if run_cmd kill -USR2 "$pid"; then
+      echo "  reloaded via USR2 (${pidf})"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+reload_php_fpm_docker() {
+  local ver="$1"
+  local compact="$2"
+  local ids id name
+  command -v docker >/dev/null 2>&1 || return 1
+
+  # Prefer containers that look like this PHP version (1Panel / Compose / custom)
+  ids="$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | \
+    grep -iE "php|fpm|1panel" | \
+    grep -iE "${ver}|${compact}|php${compact}|php-${ver}|php${ver}" | \
+    awk '{print $1}' || true)"
+
+  # Fallback: any running php-fpm-ish container
+  if [[ -z "$ids" ]]; then
+    ids="$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}' 2>/dev/null | \
+      grep -iE 'php.*fpm|fpm.*php|1panel.*php' | awk '{print $1}' || true)"
+  fi
+
+  [[ -n "$ids" ]] || return 1
+
+  for id in $ids; do
+    name="$(docker inspect -f '{{.Name}}' "$id" 2>/dev/null | sed 's#^/##')"
+    # Graceful reload inside container (USR2 to php-fpm master)
+    if docker exec "$id" sh -c '
+      for f in /run/php/*.pid /var/run/php/*.pid /usr/local/var/run/*.pid /tmp/php-fpm.pid /var/run/php-fpm.pid; do
+        [ -f "$f" ] || continue
+        pid=$(cat "$f" 2>/dev/null) || continue
+        kill -USR2 "$pid" 2>/dev/null && exit 0
+      done
+      # master often pid 1 in php-fpm containers
+      if kill -USR2 1 2>/dev/null; then exit 0; fi
+      exit 1
+    ' >/dev/null 2>&1; then
+      echo "  reloaded via docker exec USR2 (${name:-$id})"
+      return 0
+    fi
+    if run_cmd docker restart "$id"; then
+      echo "  restarted docker container ${name:-$id}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 reload_php_fpm() {
   local ver="$1"
   local major="${ver%%.*}"
   local minor="${ver#*.}"
   local compact="${major}${minor}"
-  local svc cmd
+  local svc cmd pidf
 
   echo "Reloading PHP-FPM..."
 
-  # 1) Baota panel init scripts (most common on 宝塔)
+  # 1) Panel / distro init scripts (宝塔 / aaPanel / 传统 LNMP)
   for cmd in \
     "/etc/init.d/php-fpm-${compact}" \
     "/etc/init.d/php-fpm-${ver}" \
-    "/etc/init.d/php-fpm${compact}"
+    "/etc/init.d/php-fpm${compact}" \
+    "/etc/init.d/php${compact}-fpm" \
+    "/etc/init.d/php${ver}-fpm" \
+    "/etc/init.d/php-fpm"
   do
     if [[ -x "$cmd" ]]; then
       if run_cmd "$cmd" reload || run_cmd "$cmd" restart; then
@@ -524,14 +585,15 @@ reload_php_fpm() {
     fi
   done
 
-  # 2) systemd unit names
-  if command -v systemctl >/dev/null 2>&1; then
+  # 2) systemd (Debian/Ubuntu php8.5-fpm、RHEL php-fpm、面板封装单元)
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system || -d /sys/fs/cgroup/systemd ]]; then
     for svc in \
+      "php${ver}-fpm" \
+      "php${compact}-fpm" \
       "php-fpm-${compact}" \
       "php-fpm${compact}" \
-      "php${compact}-fpm" \
-      "php${ver}-fpm" \
-      "php-fpm"
+      "php-fpm" \
+      "php${major}-fpm"
     do
       if run_cmd systemctl reload "$svc" || run_cmd systemctl restart "$svc"; then
         echo "  reloaded via systemctl ${svc}"
@@ -540,9 +602,9 @@ reload_php_fpm() {
     done
   fi
 
-  # 3) service command
+  # 3) service(8)
   if command -v service >/dev/null 2>&1; then
-    for svc in "php-fpm-${compact}" "php${ver}-fpm" "php-fpm"; do
+    for svc in "php${ver}-fpm" "php${compact}-fpm" "php-fpm-${compact}" "php-fpm"; do
       if run_cmd service "$svc" reload || run_cmd service "$svc" restart; then
         echo "  reloaded via service ${svc}"
         return 0
@@ -550,7 +612,43 @@ reload_php_fpm() {
     done
   fi
 
-  # 4) macOS Homebrew
+  # 4) supervisor (部分面板 / 容器编排)
+  if command -v supervisorctl >/dev/null 2>&1; then
+    for svc in "php-fpm" "php${ver}-fpm" "php${compact}-fpm" "php-fpm-${compact}"; do
+      if run_cmd supervisorctl restart "$svc" || run_cmd supervisorctl signal USR2 "$svc"; then
+        echo "  reloaded via supervisorctl ${svc}"
+        return 0
+      fi
+    done
+  fi
+
+  # 5) Direct USR2 via common pid files (host or inside PHP container)
+  for pidf in \
+    "/www/server/php/${compact}/var/run/php-fpm.pid" \
+    "/www/server/php/${ver}/var/run/php-fpm.pid" \
+    "/run/php/php${ver}-fpm.pid" \
+    "/run/php/php-fpm.pid" \
+    "/var/run/php/php${ver}-fpm.pid" \
+    "/var/run/php/php-fpm.pid" \
+    "/var/run/php-fpm/php-fpm.pid" \
+    "/var/run/php-fpm.pid" \
+    "/usr/local/var/run/php-fpm.pid" \
+    "/tmp/php-fpm.pid"
+  do
+    signal_fpm_pidfile "$pidf" && return 0
+  done
+  # glob leftovers
+  for pidf in /run/php/*.pid /var/run/php/*.pid; do
+    [[ -e "$pidf" ]] || continue
+    signal_fpm_pidfile "$pidf" && return 0
+  done
+
+  # 6) Docker / 1Panel / Compose PHP containers
+  if reload_php_fpm_docker "$ver" "$compact"; then
+    return 0
+  fi
+
+  # 7) macOS Homebrew
   if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
     if run_cmd brew services restart "php@${ver}" || run_cmd brew services restart php; then
       echo "  restarted via brew services"
@@ -558,24 +656,17 @@ reload_php_fpm() {
     fi
   fi
 
-  # 5) Baota: signal php-fpm master via pid if present
-  for pidf in \
-    "/www/server/php/${compact}/var/run/php-fpm.pid" \
-    "/www/server/php/${ver}/var/run/php-fpm.pid"
-  do
-    if [[ -f "$pidf" ]]; then
-      local pid
-      pid="$(tr -d ' \n' <"$pidf" 2>/dev/null || true)"
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        if run_cmd kill -USR2 "$pid"; then
-          echo "  reloaded via USR2 pid ${pid}"
-          return 0
-        fi
-      fi
+  # 8) Last resort: pkill php-fpm master gracefully (USR2)
+  if command -v pgrep >/dev/null 2>&1; then
+    local master
+    master="$(pgrep -o -f 'php-fpm: master' 2>/dev/null || pgrep -o php-fpm 2>/dev/null || true)"
+    if [[ -n "$master" ]] && run_cmd kill -USR2 "$master"; then
+      echo "  reloaded via USR2 pgrep master (${master})"
+      return 0
     fi
-  done
+  fi
 
-  echo "  warning: could not auto-reload PHP-FPM; reload manually if needed"
+  echo "  warning: could not auto-reload PHP-FPM; reload/restart your PHP runtime manually"
   return 1
 }
 
