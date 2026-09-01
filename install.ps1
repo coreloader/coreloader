@@ -1,16 +1,19 @@
 # Core Loader — one-click install (Windows PowerShell)
 # Usage:
 #   irm https://coreloader.com/core-loader-releases/install.ps1 | iex
-#   iex "& { $(irm https://coreloader.com/core-loader-releases/install.ps1) } -Php 8.5"
+#   iex "& { $(irm https://coreloader.com/core-loader-releases/install.ps1) } 8.5"
+#   .\install.ps1 8.5
 #   .\install.ps1 -Php 8.3
+[CmdletBinding(PositionalBinding = $false)]
 param(
+  [Parameter(Position = 0)]
+  [string]$Php = $(if ($env:CORELOADER_PHP) { $env:CORELOADER_PHP } else { "" }),
   [string]$BaseUrl = $(if ($env:CORELOADER_BASE_URL) { $env:CORELOADER_BASE_URL } else { "https://coreloader.com" }),
   [string]$DownloadUrl = $(if ($env:CORELOADER_DOWNLOAD_URL) { $env:CORELOADER_DOWNLOAD_URL } else { "" }),
   [string]$FallbackUrl = $(if ($env:CORELOADER_FALLBACK_URL) { $env:CORELOADER_FALLBACK_URL } else { "" }),
   [string]$Owner = $(if ($env:CORELOADER_GH_OWNER) { $env:CORELOADER_GH_OWNER } else { "coreloader" }),
   [string]$Repo = $(if ($env:CORELOADER_GH_REPO) { $env:CORELOADER_GH_REPO } else { "coreloader" }),
   [string]$Version = $(if ($env:CORELOADER_VERSION) { $env:CORELOADER_VERSION } else { "8.0.0" }),
-  [string]$Php = "",
   [string]$PhpBin = "",
   [string]$Dir = "",
   [string]$Ini = "",
