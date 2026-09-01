@@ -1,6 +1,7 @@
 # Core Loader — one-click install (Windows PowerShell)
 # Usage:
 #   irm https://coreloader.com/core-loader-releases/install.ps1 | iex
+#   iex "& { $(irm https://coreloader.com/core-loader-releases/install.ps1) } -Php 8.5"
 #   .\install.ps1 -Php 8.3
 param(
   [string]$BaseUrl = $(if ($env:CORELOADER_BASE_URL) { $env:CORELOADER_BASE_URL } else { "https://coreloader.com" }),
