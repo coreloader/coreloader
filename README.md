@@ -33,4 +33,5 @@ php -m | grep core_loader
 
 ## 手动下载
 
-→ https://coreloader.com/download
+- 主站：https://coreloader.com/extend
+- 备用：https://github.com/coreloader/coreloader/tree/main/download
