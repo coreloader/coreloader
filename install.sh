@@ -310,7 +310,8 @@ PRODUCT_VER="8.0.0"
 if [[ "$VERSION" != "latest" ]]; then
   PRODUCT_VER="${VERSION#v}"
 else
-  _latest_tag="$(curl -fsSL "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
+  _latest_tag="$(curl -fsSL --connect-timeout 5 --max-time 15 \
+    "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
     | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
   if [[ -n "${_latest_tag:-}" ]]; then
     PRODUCT_VER="${_latest_tag#v}"
@@ -354,6 +355,40 @@ else
   URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
 fi
 
+# GitHub releases often hang on CN networks — try mirrors with timeouts
+build_download_urls() {
+  local primary="$1"
+  printf '%s\n' \
+    "$primary" \
+    "https://ghfast.top/${primary}" \
+    "https://mirror.ghproxy.com/${primary}" \
+    "https://ghproxy.net/${primary}" \
+    "https://gitdl.cn/${primary}"
+}
+
+download_asset() {
+  local dest="$1"
+  shift
+  local url code
+  local -a urls=("$@")
+  local i=0 total=${#urls[@]}
+  for url in "${urls[@]}"; do
+    i=$((i + 1))
+    echo "Downloading (${i}/${total}): ${url}"
+    rm -f "$dest"
+    if curl -fL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 2 \
+         -# -o "$dest" "$url"; then
+      if [[ -s "$dest" ]]; then
+        echo "Download OK ($(wc -c <"$dest" | tr -d ' ') bytes)"
+        return 0
+      fi
+    fi
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 -L "$url" 2>/dev/null || echo fail)"
+    echo "  failed (HTTP ${code}), trying next..."
+  done
+  return 1
+}
+
 DEST="${INSTALL_DIR%/}/${DEST_NAME}"
 TMP="$(mktemp "${TMPDIR:-/tmp}/core_loader.XXXXXX.so")"
 cleanup() { rm -f "$TMP"; }
@@ -376,15 +411,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-# Always (re)download and overwrite existing extension (v2)
-if ! curl -fsSL -o "$TMP" "$URL"; then
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -L "$URL" || echo fail)"
-  echo "Error: download failed (HTTP ${code}): ${URL}" >&2
-  echo "Check that the release exists and the asset name matches your PHP/OS/arch." >&2
-  exit 1
-fi
-if [[ ! -s "$TMP" ]]; then
-  echo "Error: downloaded file is empty: ${URL}" >&2
+DOWNLOAD_URLS=()
+while IFS= read -r _u; do
+  [[ -n "$_u" ]] && DOWNLOAD_URLS+=("$_u")
+done < <(build_download_urls "$URL")
+
+if ! download_asset "$TMP" "${DOWNLOAD_URLS[@]}"; then
+  echo "Error: download failed for all mirrors: ${ASSET}" >&2
+  echo "Primary URL: ${URL}" >&2
+  echo "Check network access to GitHub Releases, or download manually and place at:" >&2
+  echo "  ${DEST}" >&2
   exit 1
 fi
 
