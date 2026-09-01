@@ -112,8 +112,8 @@ resolve_fallback_url() {
 resolve_fallback_url
 
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
-  echo "Windows detected. Use install.ps1 instead:" >&2
-  echo "  irm ${INSTALL_BASE}/install.ps1 | iex" >&2
+  echo "Windows detected. Use install.cmd instead:" >&2
+  echo "  cmd /c \"curl -fsSL -o %TEMP%\\cl-install.cmd ${INSTALL_BASE}/install.cmd && call %TEMP%\\cl-install.cmd\"" >&2
   exit 1
 fi
 

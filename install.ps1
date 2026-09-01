@@ -1,7 +1,7 @@
-# Core Loader — one-click install (Windows PowerShell)
-# Usage:
-#   irm https://coreloader.com/core-loader-releases/install.ps1 | iex
-#   iex "& { $(irm https://coreloader.com/core-loader-releases/install.ps1) } 8.5"
+# Core Loader — Windows install engine (invoked by install.cmd)
+# Public entry (CMD / PowerShell):
+#   cmd /c "curl -fsSL -o %TEMP%\cl-install.cmd https://coreloader.com/core-loader-releases/install.cmd && call %TEMP%\cl-install.cmd"
+# Direct:
 #   .\install.ps1 8.5
 #   .\install.ps1 -Php 8.3
 [CmdletBinding(PositionalBinding = $false)]
