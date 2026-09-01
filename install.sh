@@ -369,22 +369,22 @@ build_download_urls() {
 download_asset() {
   local dest="$1"
   shift
-  local url code
+  local url
   local -a urls=("$@")
-  local i=0 total=${#urls[@]}
+  local first=1
   for url in "${urls[@]}"; do
-    i=$((i + 1))
-    echo "Downloading (${i}/${total}): ${url}"
+    if [[ "$first" -eq 1 ]]; then
+      echo "Downloading:"
+      first=0
+    fi
     rm -f "$dest"
+    # Progress bar only; hide URL / mirror index
     if curl -fL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 2 \
-         -# -o "$dest" "$url"; then
+         -# -o "$dest" "$url" 2>&1; then
       if [[ -s "$dest" ]]; then
-        echo "Download OK ($(wc -c <"$dest" | tr -d ' ') bytes)"
         return 0
       fi
     fi
-    code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 20 -L "$url" 2>/dev/null || echo fail)"
-    echo "  failed (HTTP ${code}), trying next..."
   done
   return 1
 }
