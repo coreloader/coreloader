@@ -43,7 +43,7 @@ irm https://raw.githubusercontent.com/coreloader/coreloader/main/install.ps1 | i
 php -r 'var_export(extension_loaded("core_loader")); echo PHP_EOL;'
 ```
 
-宝塔：安装完成后脚本会自动重载对应 PHP-FPM；不需要可加 `--no-reload`。
+安装完成后会自动重载 PHP-FPM，覆盖常见环境：宝塔、1Panel / Docker 容器、systemd（如 `php8.5-fpm`）、supervisor、pid 信号等。不需要可加 `--no-reload`。
 
 与 OPcache 同时开启时：保持两者均为 `extension=` 加载即可；Core Loader 在编译阶段解密后再进入正常编译链，可被 OPcache 缓存。
 
