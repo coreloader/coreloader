@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 # Core Loader — one-click install (Linux / macOS)
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/coreloader/coreloader/main/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- --version v8.0.0
+#   curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
+#   curl -fsSL .../install.sh | bash -s -- --php 8.5
 #   ./install.sh --php 8.3 --dir /www/server/php/83/lib/php/extensions/...
 set -euo pipefail
 
-# Defaults — https://github.com/coreloader/coreloader
-DEFAULT_OWNER="${CORELOADER_GH_OWNER:-coreloader}"
-DEFAULT_REPO="${CORELOADER_GH_REPO:-coreloader}"
-DEFAULT_VERSION="${CORELOADER_VERSION:-latest}"
+# Defaults — https://coreloader.com
+DEFAULT_BASE="${CORELOADER_BASE_URL:-https://coreloader.com}"
+DEFAULT_DOWNLOAD="${CORELOADER_DOWNLOAD_URL:-${DEFAULT_BASE}/download}"
+DEFAULT_INSTALL_BASE="${CORELOADER_INSTALL_BASE:-${DEFAULT_BASE}/core-loader-releases}"
+DEFAULT_FALLBACK="${CORELOADER_FALLBACK_URL:-https://raw.githubusercontent.com/coreloader/coreloader/main/download}"
+DEFAULT_VERSION="${CORELOADER_VERSION:-8.0.0}"
 
-OWNER="$DEFAULT_OWNER"
-REPO="$DEFAULT_REPO"
+BASE_URL="$DEFAULT_BASE"
+DOWNLOAD_URL="$DEFAULT_DOWNLOAD"
+INSTALL_BASE="$DEFAULT_INSTALL_BASE"
+FALLBACK_URL="$DEFAULT_FALLBACK"
 VERSION="$DEFAULT_VERSION"
 PHP_VER=""
 PHP_BIN=""
@@ -28,13 +32,14 @@ usage() {
   cat <<EOF
 
 Options:
-  --owner NAME       GitHub owner (default: $DEFAULT_OWNER)
-  --repo NAME        GitHub repo  (default: $DEFAULT_REPO)
-  --version TAG      Release tag or "latest" (default: $DEFAULT_VERSION)
+  --version X.Y.Z    Product version for ini comment (default: $DEFAULT_VERSION)
   --php X.Y          PHP major.minor (default: detect from php)
   --php-bin PATH     PHP binary to use (default: auto-detect)
   --dir PATH         Extension install directory (default: php-config --extension-dir)
   --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
+  --base-url URL     Site root (default: $DEFAULT_BASE)
+  --download-url URL Extension download root (default: $DEFAULT_DOWNLOAD)
+  --fallback-url URL Backup download root (default: $DEFAULT_FALLBACK)
   --no-ini           Do not modify php.ini / conf.d
   --no-reload        Do not reload PHP-FPM after install
   --dry-run          Print actions only
@@ -45,13 +50,14 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --owner) OWNER="$2"; shift 2 ;;
-    --repo) REPO="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --php) PHP_VER="$2"; shift 2 ;;
     --php-bin) PHP_BIN="$2"; shift 2 ;;
     --dir) INSTALL_DIR="$2"; shift 2 ;;
     --ini) INI_FILE="$2"; shift 2 ;;
+    --base-url) BASE_URL="$2"; DOWNLOAD_URL="${BASE_URL%/}/download"; INSTALL_BASE="${BASE_URL%/}/core-loader-releases"; shift 2 ;;
+    --download-url) DOWNLOAD_URL="$2"; shift 2 ;;
+    --fallback-url) FALLBACK_URL="$2"; shift 2 ;;
     --no-ini) NO_INI=1; shift ;;
     --no-reload) NO_RELOAD=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -61,14 +67,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$OWNER" || -z "$REPO" ]]; then
-  echo "Error: owner/repo must not be empty" >&2
-  exit 1
-fi
-
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
   echo "Windows detected. Use install.ps1 instead:" >&2
-  echo "  irm https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.ps1 | iex" >&2
+  echo "  irm ${INSTALL_BASE}/install.ps1 | iex" >&2
   exit 1
 fi
 
@@ -309,15 +310,14 @@ DEST_NAME="core_loader.so"
 INI_LINE="extension=${DEST_NAME}"
 
 # Release label for ini comment, e.g. "; Core Loader 8.0.0"
-PRODUCT_VER="8.0.0"
-if [[ "$VERSION" != "latest" ]]; then
-  PRODUCT_VER="${VERSION#v}"
-else
-  _latest_tag="$(curl -fsSL --connect-timeout 5 --max-time 15 \
-    "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" 2>/dev/null \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)"
-  if [[ -n "${_latest_tag:-}" ]]; then
-    PRODUCT_VER="${_latest_tag#v}"
+PRODUCT_VER="${VERSION#v}"
+if [[ "$PRODUCT_VER" == "latest" || -z "$PRODUCT_VER" ]]; then
+  PRODUCT_VER="8.0.0"
+  _ver_file="$(curl -fsSL --connect-timeout 5 --max-time 10 "${DOWNLOAD_URL%/}/VERSION" 2>/dev/null \
+    || curl -fsSL --connect-timeout 5 --max-time 15 "${FALLBACK_URL%/}/VERSION" 2>/dev/null \
+    || true)"
+  if [[ -n "${_ver_file:-}" ]]; then
+    PRODUCT_VER="$(printf '%s' "$_ver_file" | head -1 | tr -d '\r' | sed 's/^v//')"
   fi
 fi
 INI_COMMENT="; Core Loader ${PRODUCT_VER}"
@@ -350,23 +350,13 @@ if [[ "$NO_INI" -eq 0 ]]; then
   fi
 fi
 
-if [[ "$VERSION" == "latest" ]]; then
-  URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/${ASSET}"
-else
-  TAG="$VERSION"
-  [[ "$TAG" == v* ]] || TAG="v${TAG}"
-  URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${ASSET}"
-fi
+# Primary: https://coreloader.com/download/<asset>
+# Backup:  https://raw.githubusercontent.com/coreloader/coreloader/main/download/<asset>
+URL="${DOWNLOAD_URL%/}/${ASSET}"
+FALLBACK_ASSET_URL="${FALLBACK_URL%/}/${ASSET}"
 
-# GitHub releases often hang on CN networks — try mirrors with timeouts
 build_download_urls() {
-  local primary="$1"
-  printf '%s\n' \
-    "$primary" \
-    "https://ghfast.top/${primary}" \
-    "https://mirror.ghproxy.com/${primary}" \
-    "https://ghproxy.net/${primary}" \
-    "https://gitdl.cn/${primary}"
+  printf '%s\n' "$URL" "$FALLBACK_ASSET_URL"
 }
 
 download_asset() {
@@ -374,15 +364,23 @@ download_asset() {
   shift
   local url
   local -a urls=("$@")
-  local first=1
+  local idx=0
+  local connect_to max_to
+
+  echo "Downloading:"
   for url in "${urls[@]}"; do
-    if [[ "$first" -eq 1 ]]; then
-      echo "Downloading:"
-      first=0
-    fi
+    idx=$((idx + 1))
     rm -f "$dest"
-    # Progress bar only; hide URL / mirror index
-    if curl -fL --connect-timeout 10 --max-time 180 --retry 2 --retry-delay 2 \
+    # Primary site: fail fast; backup: allow longer transfer
+    if [[ "$idx" -eq 1 ]]; then
+      connect_to=8
+      max_to=45
+    else
+      echo "Switching to backup..."
+      connect_to=10
+      max_to=180
+    fi
+    if curl -fL --connect-timeout "$connect_to" --max-time "$max_to" --retry 1 \
          -# -o "$dest" "$url" 2>&1; then
       if [[ -s "$dest" ]]; then
         return 0
@@ -402,6 +400,7 @@ echo "  PHP:     ${PHP_VER} (${PHP_BIN})"
 echo "  OS/Arch: ${OS}-${ARCH}"
 echo "  Asset:   ${ASSET}"
 echo "  From:    ${URL}"
+echo "  Backup:  ${FALLBACK_ASSET_URL}"
 echo "  To:      ${DEST}"
 if [[ "$NO_INI" -eq 0 ]]; then
   echo "  Ini:     ${INI_TARGETS[*]}"
@@ -417,13 +416,13 @@ fi
 DOWNLOAD_URLS=()
 while IFS= read -r _u; do
   [[ -n "$_u" ]] && DOWNLOAD_URLS+=("$_u")
-done < <(build_download_urls "$URL")
+done < <(build_download_urls)
 
 if ! download_asset "$TMP" "${DOWNLOAD_URLS[@]}"; then
-  echo "Error: download failed for all mirrors: ${ASSET}" >&2
-  echo "Primary URL: ${URL}" >&2
-  echo "Check network access to GitHub Releases, or download manually and place at:" >&2
-  echo "  ${DEST}" >&2
+  echo "Error: download failed (primary + backup): ${ASSET}" >&2
+  echo "  primary: ${URL}" >&2
+  echo "  backup:  ${FALLBACK_ASSET_URL}" >&2
+  echo "Place file manually at: ${DEST}" >&2
   exit 1
 fi
 

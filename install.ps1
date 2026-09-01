@@ -1,11 +1,12 @@
 # Core Loader — one-click install (Windows PowerShell)
 # Usage:
-#   irm https://raw.githubusercontent.com/coreloader/coreloader/main/install.ps1 | iex
-#   .\install.ps1 -Version v8.0.0 -Php 8.3
+#   irm https://coreloader.com/core-loader-releases/install.ps1 | iex
+#   .\install.ps1 -Php 8.3
 param(
-  [string]$Owner = $(if ($env:CORELOADER_GH_OWNER) { $env:CORELOADER_GH_OWNER } else { "coreloader" }),
-  [string]$Repo = $(if ($env:CORELOADER_GH_REPO) { $env:CORELOADER_GH_REPO } else { "coreloader" }),
-  [string]$Version = $(if ($env:CORELOADER_VERSION) { $env:CORELOADER_VERSION } else { "latest" }),
+  [string]$BaseUrl = $(if ($env:CORELOADER_BASE_URL) { $env:CORELOADER_BASE_URL } else { "https://coreloader.com" }),
+  [string]$DownloadUrl = $(if ($env:CORELOADER_DOWNLOAD_URL) { $env:CORELOADER_DOWNLOAD_URL } else { "" }),
+  [string]$FallbackUrl = $(if ($env:CORELOADER_FALLBACK_URL) { $env:CORELOADER_FALLBACK_URL } else { "https://raw.githubusercontent.com/coreloader/coreloader/main/download" }),
+  [string]$Version = $(if ($env:CORELOADER_VERSION) { $env:CORELOADER_VERSION } else { "8.0.0" }),
   [string]$Php = "",
   [string]$PhpBin = "",
   [string]$Dir = "",
@@ -18,9 +19,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if ([string]::IsNullOrWhiteSpace($Owner) -or [string]::IsNullOrWhiteSpace($Repo)) {
-  Write-Error "Owner/Repo must not be empty"
+if ([string]::IsNullOrWhiteSpace($DownloadUrl)) {
+  $DownloadUrl = "$($BaseUrl.TrimEnd('/'))/download"
 }
+$InstallBase = "$($BaseUrl.TrimEnd('/'))/core-loader-releases"
 
 function Get-PhpVersionFromBin([string]$bin) {
   $out = & $bin -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>$null
@@ -118,40 +120,30 @@ function Update-PhpIni([string]$path, [string]$line, [string]$comment) {
   Write-Host "  ini: updated $path"
 }
 
-function Get-DownloadUrls([string]$primary) {
-  return @(
-    $primary,
-    "https://ghfast.top/$primary",
-    "https://mirror.ghproxy.com/$primary",
-    "https://ghproxy.net/$primary",
-    "https://gitdl.cn/$primary"
-  )
-}
-
 function Download-Asset([string]$dest, [string[]]$urls) {
   Write-Host "Downloading:"
-  $i = 0
+  $idx = 0
   foreach ($u in $urls) {
-    $i++
+    $idx++
+    $timeout = if ($idx -eq 1) { 45 } else { 180 }
+    if ($idx -gt 1) { Write-Host "Switching to backup..." }
     try {
-      # Progress shown by Invoke-WebRequest in interactive hosts
-      Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing -TimeoutSec 180
+      if (Test-Path $dest) { Remove-Item -Force $dest }
+      Invoke-WebRequest -Uri $u -OutFile $dest -UseBasicParsing -TimeoutSec $timeout
       if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) {
         return
       }
     } catch {
-      # try next mirror silently
+      # try next
     }
   }
-  throw "Download failed for all mirrors"
+  throw "Download failed (primary + backup)"
 }
 
 function Restart-PhpRuntime([string]$phpVer) {
   Write-Host "Reloading PHP runtime..."
   $compact = ($phpVer -replace '\.', '')
-  $ok = $false
 
-  # IIS
   try {
     if (Get-Command iisreset -ErrorAction SilentlyContinue) {
       & iisreset /noforce 2>$null | Out-Null
@@ -165,6 +157,7 @@ function Restart-PhpRuntime([string]$phpVer) {
   try {
     Import-Module WebAdministration -ErrorAction SilentlyContinue
     if (Get-Command Restart-WebAppPool -ErrorAction SilentlyContinue) {
+      $ok = $false
       Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue | ForEach-Object {
         Restart-WebAppPool $_.Name -ErrorAction SilentlyContinue
         $ok = $true
@@ -176,19 +169,9 @@ function Restart-PhpRuntime([string]$phpVer) {
     }
   } catch {}
 
-  # Windows services commonly used by panels / phpstudy / custom NSSM
   $serviceNames = @(
-    "php-fpm-$compact",
-    "php-fpm$compact",
-    "php$compact-fpm",
-    "php$phpVer-fpm",
-    "php-cgi-$compact",
-    "php-cgi",
-    "php-fpm",
-    "w3svc",
-    "Apache2.4",
-    "Apache2.2",
-    "nginx"
+    "php-fpm-$compact", "php-fpm$compact", "php$compact-fpm", "php$phpVer-fpm",
+    "php-cgi-$compact", "php-cgi", "php-fpm", "w3svc", "Apache2.4", "Apache2.2", "nginx"
   )
   foreach ($name in $serviceNames) {
     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -200,7 +183,6 @@ function Restart-PhpRuntime([string]$phpVer) {
     } catch {}
   }
 
-  # Docker Desktop / Windows containers (1Panel-like / compose)
   if (Get-Command docker -ErrorAction SilentlyContinue) {
     $rows = docker ps --format "{{.ID}} {{.Names}} {{.Image}}" 2>$null
     if ($rows) {
@@ -228,7 +210,7 @@ if (-not $Php) { $Php = Get-PhpVersionFromBin $PhpBin }
 
 $supported = @("7.0","7.1","7.2","7.3","7.4","8.0","8.1","8.2","8.3","8.4","8.5")
 if ($supported -notcontains $Php) {
-  throw "Unsupported PHP version '$Php' (supported: 7.0–8.5). Hint: -Version is the Release tag (v8.0.0); use -Php 8.3 for PHP version."
+  throw "Unsupported PHP version '$Php' (supported: 7.0–8.5). Use -Php 8.3 for PHP version."
 }
 
 $arch = Get-WinArch
@@ -237,14 +219,18 @@ $destName = "php_core_loader.dll"
 $installDir = Get-ExtensionDir $PhpBin
 $iniLine = "extension=$destName"
 
-$productVer = "8.0.0"
-if ($Version -ne "latest") {
-  $productVer = $Version.TrimStart('v')
-} else {
-  try {
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$Owner/$Repo/releases/latest" -UseBasicParsing -TimeoutSec 15
-    if ($rel.tag_name) { $productVer = $rel.tag_name.TrimStart('v') }
-  } catch {}
+$productVer = $Version.TrimStart('v')
+if ($productVer -eq "latest" -or [string]::IsNullOrWhiteSpace($productVer)) {
+  $productVer = "8.0.0"
+  foreach ($verUrl in @("$($DownloadUrl.TrimEnd('/'))/VERSION", "$($FallbackUrl.TrimEnd('/'))/VERSION")) {
+    try {
+      $verText = (Invoke-WebRequest -Uri $verUrl -UseBasicParsing -TimeoutSec 10).Content
+      if ($verText) {
+        $productVer = ($verText -split "`n")[0].Trim().TrimStart('v')
+        break
+      }
+    } catch {}
+  }
 }
 $iniComment = "; Core Loader $productVer"
 
@@ -253,13 +239,8 @@ if (-not $NoIni) {
   $iniPaths = Get-IniTargets $PhpBin
 }
 
-if ($Version -eq "latest") {
-  $url = "https://github.com/$Owner/$Repo/releases/latest/download/$asset"
-} else {
-  $tag = if ($Version.StartsWith("v")) { $Version } else { "v$Version" }
-  $url = "https://github.com/$Owner/$Repo/releases/download/$tag/$asset"
-}
-
+$url = "$($DownloadUrl.TrimEnd('/'))/$asset"
+$fallbackAssetUrl = "$($FallbackUrl.TrimEnd('/'))/$asset"
 $dest = Join-Path $installDir $destName
 
 Write-Host "Core Loader install"
@@ -267,6 +248,7 @@ Write-Host "  PHP:     $Php ($PhpBin)"
 Write-Host "  Arch:    win-$arch"
 Write-Host "  Asset:   $asset"
 Write-Host "  From:    $url"
+Write-Host "  Backup:  $fallbackAssetUrl"
 Write-Host "  To:      $dest"
 if ($NoIni) {
   Write-Host "  Ini:     (skipped)"
@@ -281,7 +263,7 @@ if ($DryRun) {
 
 $tmp = Join-Path $env:TEMP ("core_loader_" + [guid]::NewGuid().ToString() + ".dll")
 try {
-  Download-Asset -dest $tmp -urls (Get-DownloadUrls $url)
+  Download-Asset -dest $tmp -urls @($url, $fallbackAssetUrl)
 
   $fs = [System.IO.File]::OpenRead($tmp)
   try {
