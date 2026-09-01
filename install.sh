@@ -358,69 +358,76 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 
 if [[ -f "$DEST" && "$FORCE" -ne 1 ]]; then
-  echo "Error: ${DEST} already exists (use --force to overwrite)" >&2
-  exit 1
+  echo "Extension already exists: ${DEST}"
+  echo "  (skip download; use --force to overwrite the .so)"
+  SKIP_DOWNLOAD=1
+else
+  SKIP_DOWNLOAD=0
 fi
 
-if ! curl -fsSL -o "$TMP" "$URL"; then
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -L "$URL" || echo fail)"
-  echo "Error: download failed (HTTP ${code}): ${URL}" >&2
-  echo "Check that the release exists and the asset name matches your PHP/OS/arch." >&2
-  exit 1
-fi
-if [[ ! -s "$TMP" ]]; then
-  echo "Error: downloaded file is empty: ${URL}" >&2
-  exit 1
-fi
+if [[ "$SKIP_DOWNLOAD" -eq 0 ]]; then
+  if ! curl -fsSL -o "$TMP" "$URL"; then
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -L "$URL" || echo fail)"
+    echo "Error: download failed (HTTP ${code}): ${URL}" >&2
+    echo "Check that the release exists and the asset name matches your PHP/OS/arch." >&2
+    exit 1
+  fi
+  if [[ ! -s "$TMP" ]]; then
+    echo "Error: downloaded file is empty: ${URL}" >&2
+    exit 1
+  fi
 
-magic="$(xxd -l 4 -p "$TMP" 2>/dev/null || od -An -tx1 -N4 "$TMP" | tr -d ' \n')"
-magic="$(echo "$magic" | tr -d ' \n')"
-case "$OS" in
-  linux)
-    if [[ "$magic" != 7f454c46 ]]; then
-      echo "Error: downloaded file is not an ELF shared object (magic=$magic)" >&2
-      exit 1
-    fi
-    ;;
-  darwin)
-    case "$magic" in
-      cffaedfe|feedfacf|cafebabe|befaceca) ;;
-      *)
-        echo "Error: downloaded file is not a Mach-O library (magic=$magic)" >&2
+  magic="$(xxd -l 4 -p "$TMP" 2>/dev/null || od -An -tx1 -N4 "$TMP" | tr -d ' \n')"
+  magic="$(echo "$magic" | tr -d ' \n')"
+  case "$OS" in
+    linux)
+      if [[ "$magic" != 7f454c46 ]]; then
+        echo "Error: downloaded file is not an ELF shared object (magic=$magic)" >&2
         exit 1
-        ;;
-    esac
-    ;;
-esac
+      fi
+      ;;
+    darwin)
+      case "$magic" in
+        cffaedfe|feedfacf|cafebabe|befaceca) ;;
+        *)
+          echo "Error: downloaded file is not a Mach-O library (magic=$magic)" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+  esac
 
-mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-if ! cp -f "$TMP" "$DEST" 2>/dev/null; then
-  echo "Permission denied writing ${DEST}"
-  if [[ -t 0 ]]; then
-    read -r -p "Retry with sudo? [y/N] " ans || true
-    if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
-      sudo mkdir -p "$INSTALL_DIR"
-      sudo cp -f "$TMP" "$DEST"
-    else
-      exit 1
-    fi
-  else
-    if sudo -n true 2>/dev/null || [[ "$(id -u)" -eq 0 ]]; then
-      sudo mkdir -p "$INSTALL_DIR" 2>/dev/null || mkdir -p "$INSTALL_DIR"
-      if [[ "$(id -u)" -eq 0 ]]; then
-        cp -f "$TMP" "$DEST"
-      else
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+  if ! cp -f "$TMP" "$DEST" 2>/dev/null; then
+    echo "Permission denied writing ${DEST}"
+    if [[ -t 0 ]]; then
+      read -r -p "Retry with sudo? [y/N] " ans || true
+      if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+        sudo mkdir -p "$INSTALL_DIR"
         sudo cp -f "$TMP" "$DEST"
+      else
+        exit 1
       fi
     else
-      echo "Error: need root/sudo to write ${DEST}" >&2
-      exit 1
+      if sudo -n true 2>/dev/null || [[ "$(id -u)" -eq 0 ]]; then
+        sudo mkdir -p "$INSTALL_DIR" 2>/dev/null || mkdir -p "$INSTALL_DIR"
+        if [[ "$(id -u)" -eq 0 ]]; then
+          cp -f "$TMP" "$DEST"
+        else
+          sudo cp -f "$TMP" "$DEST"
+        fi
+      else
+        echo "Error: need root/sudo to write ${DEST}" >&2
+        exit 1
+      fi
     fi
   fi
-fi
 
-chmod 755 "$DEST" 2>/dev/null || sudo chmod 755 "$DEST" 2>/dev/null || true
-echo "Installed: ${DEST}"
+  chmod 755 "$DEST" 2>/dev/null || sudo chmod 755 "$DEST" 2>/dev/null || true
+  echo "Installed: ${DEST}"
+else
+  echo "Using existing: ${DEST}"
+fi
 
 if [[ "$NO_INI" -eq 0 ]]; then
   echo "Configuring PHP..."
