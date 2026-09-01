@@ -16,7 +16,7 @@ curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
 irm https://coreloader.com/core-loader-releases/install.ps1 | iex
 ```
 
-脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
+###脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
 
 多 PHP 版本时指定：
 
@@ -34,4 +34,4 @@ php -m | grep core_loader
 ## 手动下载
 
 - 主站：https://coreloader.com/extend
-- 备用：https://github.com/coreloader/coreloader/tree/main/download
+- 备用：https://github.com/coreloader/coreloader/releases

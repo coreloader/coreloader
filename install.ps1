@@ -5,7 +5,9 @@
 param(
   [string]$BaseUrl = $(if ($env:CORELOADER_BASE_URL) { $env:CORELOADER_BASE_URL } else { "https://coreloader.com" }),
   [string]$DownloadUrl = $(if ($env:CORELOADER_DOWNLOAD_URL) { $env:CORELOADER_DOWNLOAD_URL } else { "" }),
-  [string]$FallbackUrl = $(if ($env:CORELOADER_FALLBACK_URL) { $env:CORELOADER_FALLBACK_URL } else { "https://raw.githubusercontent.com/coreloader/coreloader/main/download" }),
+  [string]$FallbackUrl = $(if ($env:CORELOADER_FALLBACK_URL) { $env:CORELOADER_FALLBACK_URL } else { "" }),
+  [string]$Owner = $(if ($env:CORELOADER_GH_OWNER) { $env:CORELOADER_GH_OWNER } else { "coreloader" }),
+  [string]$Repo = $(if ($env:CORELOADER_GH_REPO) { $env:CORELOADER_GH_REPO } else { "coreloader" }),
   [string]$Version = $(if ($env:CORELOADER_VERSION) { $env:CORELOADER_VERSION } else { "8.0.0" }),
   [string]$Php = "",
   [string]$PhpBin = "",
@@ -23,6 +25,17 @@ if ([string]::IsNullOrWhiteSpace($DownloadUrl)) {
   $DownloadUrl = "$($BaseUrl.TrimEnd('/'))/download"
 }
 $InstallBase = "$($BaseUrl.TrimEnd('/'))/core-loader-releases"
+
+# Backup: GitHub Release assets
+if ([string]::IsNullOrWhiteSpace($FallbackUrl)) {
+  if ([string]::IsNullOrWhiteSpace($Version) -or $Version -eq "latest") {
+    $FallbackUrl = "https://github.com/$Owner/$Repo/releases/latest/download"
+  } else {
+    $tag = $Version
+    if (-not $tag.StartsWith("v")) { $tag = "v$tag" }
+    $FallbackUrl = "https://github.com/$Owner/$Repo/releases/download/$tag"
+  }
+}
 
 function Get-PhpVersionFromBin([string]$bin) {
   $out = & $bin -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>$null
@@ -222,15 +235,12 @@ $iniLine = "extension=$destName"
 $productVer = $Version.TrimStart('v')
 if ($productVer -eq "latest" -or [string]::IsNullOrWhiteSpace($productVer)) {
   $productVer = "8.0.0"
-  foreach ($verUrl in @("$($DownloadUrl.TrimEnd('/'))/VERSION", "$($FallbackUrl.TrimEnd('/'))/VERSION")) {
-    try {
-      $verText = (Invoke-WebRequest -Uri $verUrl -UseBasicParsing -TimeoutSec 10).Content
-      if ($verText) {
-        $productVer = ($verText -split "`n")[0].Trim().TrimStart('v')
-        break
-      }
-    } catch {}
-  }
+  try {
+    $verText = (Invoke-WebRequest -Uri "$($DownloadUrl.TrimEnd('/'))/VERSION" -UseBasicParsing -TimeoutSec 10).Content
+    if ($verText) {
+      $productVer = ($verText -split "`n")[0].Trim().TrimStart('v')
+    }
+  } catch {}
 }
 $iniComment = "; Core Loader $productVer"
 

@@ -6,17 +6,22 @@
 #   ./install.sh --php 8.3 --dir /www/server/php/83/lib/php/extensions/...
 set -euo pipefail
 
-# Defaults — https://coreloader.com
+# Defaults — primary: https://coreloader.com ; backup: GitHub Releases
 DEFAULT_BASE="${CORELOADER_BASE_URL:-https://coreloader.com}"
 DEFAULT_DOWNLOAD="${CORELOADER_DOWNLOAD_URL:-${DEFAULT_BASE}/download}"
 DEFAULT_INSTALL_BASE="${CORELOADER_INSTALL_BASE:-${DEFAULT_BASE}/core-loader-releases}"
-DEFAULT_FALLBACK="${CORELOADER_FALLBACK_URL:-https://raw.githubusercontent.com/coreloader/coreloader/main/download}"
+DEFAULT_GH_OWNER="${CORELOADER_GH_OWNER:-coreloader}"
+DEFAULT_GH_REPO="${CORELOADER_GH_REPO:-coreloader}"
 DEFAULT_VERSION="${CORELOADER_VERSION:-8.0.0}"
+# Empty = auto from GitHub Release tag; override with CORELOADER_FALLBACK_URL / --fallback-url
+DEFAULT_FALLBACK="${CORELOADER_FALLBACK_URL:-}"
 
 BASE_URL="$DEFAULT_BASE"
 DOWNLOAD_URL="$DEFAULT_DOWNLOAD"
 INSTALL_BASE="$DEFAULT_INSTALL_BASE"
 FALLBACK_URL="$DEFAULT_FALLBACK"
+GH_OWNER="$DEFAULT_GH_OWNER"
+GH_REPO="$DEFAULT_GH_REPO"
 VERSION="$DEFAULT_VERSION"
 PHP_VER=""
 PHP_BIN=""
@@ -26,6 +31,8 @@ NO_INI=0
 NO_RELOAD=0
 DRY_RUN=0
 FORCE=0
+FALLBACK_SET=0
+[[ -n "$DEFAULT_FALLBACK" ]] && FALLBACK_SET=1
 
 usage() {
   sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
@@ -39,7 +46,9 @@ Options:
   --ini PATH         php.ini or conf.d drop-in to write (default: auto-detect)
   --base-url URL     Site root (default: $DEFAULT_BASE)
   --download-url URL Extension download root (default: $DEFAULT_DOWNLOAD)
-  --fallback-url URL Backup download root (default: $DEFAULT_FALLBACK)
+  --fallback-url URL Backup download root (default: GitHub Releases for --version)
+  --owner NAME       GitHub owner for Release backup (default: $DEFAULT_GH_OWNER)
+  --repo NAME        GitHub repo for Release backup (default: $DEFAULT_GH_REPO)
   --no-ini           Do not modify php.ini / conf.d
   --no-reload        Do not reload PHP-FPM after install
   --dry-run          Print actions only
@@ -57,7 +66,9 @@ while [[ $# -gt 0 ]]; do
     --ini) INI_FILE="$2"; shift 2 ;;
     --base-url) BASE_URL="$2"; DOWNLOAD_URL="${BASE_URL%/}/download"; INSTALL_BASE="${BASE_URL%/}/core-loader-releases"; shift 2 ;;
     --download-url) DOWNLOAD_URL="$2"; shift 2 ;;
-    --fallback-url) FALLBACK_URL="$2"; shift 2 ;;
+    --fallback-url) FALLBACK_URL="$2"; FALLBACK_SET=1; shift 2 ;;
+    --owner) GH_OWNER="$2"; shift 2 ;;
+    --repo) GH_REPO="$2"; shift 2 ;;
     --no-ini) NO_INI=1; shift ;;
     --no-reload) NO_RELOAD=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -66,6 +77,23 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+# Backup: GitHub Release assets
+#   latest → .../releases/latest/download/<asset>
+#   v8.0.0 → .../releases/download/v8.0.0/<asset>
+resolve_fallback_url() {
+  if [[ "$FALLBACK_SET" -eq 1 && -n "$FALLBACK_URL" ]]; then
+    return 0
+  fi
+  local tag="${VERSION}"
+  if [[ -z "$tag" || "$tag" == "latest" ]]; then
+    FALLBACK_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/latest/download"
+  else
+    [[ "$tag" == v* ]] || tag="v${tag}"
+    FALLBACK_URL="https://github.com/${GH_OWNER}/${GH_REPO}/releases/download/${tag}"
+  fi
+}
+resolve_fallback_url
 
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
   echo "Windows detected. Use install.ps1 instead:" >&2
@@ -313,9 +341,7 @@ INI_LINE="extension=${DEST_NAME}"
 PRODUCT_VER="${VERSION#v}"
 if [[ "$PRODUCT_VER" == "latest" || -z "$PRODUCT_VER" ]]; then
   PRODUCT_VER="8.0.0"
-  _ver_file="$(curl -fsSL --connect-timeout 5 --max-time 10 "${DOWNLOAD_URL%/}/VERSION" 2>/dev/null \
-    || curl -fsSL --connect-timeout 5 --max-time 15 "${FALLBACK_URL%/}/VERSION" 2>/dev/null \
-    || true)"
+  _ver_file="$(curl -fsSL --connect-timeout 5 --max-time 10 "${DOWNLOAD_URL%/}/VERSION" 2>/dev/null || true)"
   if [[ -n "${_ver_file:-}" ]]; then
     PRODUCT_VER="$(printf '%s' "$_ver_file" | head -1 | tr -d '\r' | sed 's/^v//')"
   fi
@@ -351,7 +377,7 @@ if [[ "$NO_INI" -eq 0 ]]; then
 fi
 
 # Primary: https://coreloader.com/download/<asset>
-# Backup:  https://raw.githubusercontent.com/coreloader/coreloader/main/download/<asset>
+# Backup:  https://github.com/coreloader/coreloader/releases/download/vX.Y.Z/<asset>
 URL="${DOWNLOAD_URL%/}/${ASSET}"
 FALLBACK_ASSET_URL="${FALLBACK_URL%/}/${ASSET}"
 
