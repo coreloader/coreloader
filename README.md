@@ -12,12 +12,18 @@
 curl -fsSL https://raw.githubusercontent.com/coreloader/coreloader/main/install.sh | bash
 ```
 
-指定版本：
+指定 Release / PHP 版本（宝塔多版本示例）：
 
 ```bash
+# Release 标签用 --version；PHP 版本用 --php
 curl -fsSL https://raw.githubusercontent.com/coreloader/coreloader/main/install.sh \
-  | bash -s -- --version v8.0.0
+  | bash -s -- --version v8.0.0 --php 8.5 --force
 ```
+
+脚本会自动：
+
+1. 下载对应平台的扩展到该 PHP 的 `extension_dir`
+2. **写入配置**（优先 `php.d`/`conf.d` 下的 `99-core_loader.ini`，否则追加到主 `php.ini`）
 
 ### Windows (PowerShell)
 
@@ -27,20 +33,17 @@ irm https://raw.githubusercontent.com/coreloader/coreloader/main/install.ps1 | i
 
 ## 配置
 
-安装后在 `php.ini` 中启用（**必须用 `extension=`，不要用 `zend_extension=`**）：
-
-```ini
-extension=core_loader.so
-; Windows:
-; extension=php_core_loader.dll
-```
+安装脚本默认已写入 `extension=core_loader.so`（**不会**写成 `zend_extension=`）。  
+若不需要自动改配置，可加 `--no-ini`。
 
 验证：
 
 ```bash
-php -m | grep core_loader
+/www/server/php/85/bin/php -m | grep core_loader
 php -r 'var_export(extension_loaded("core_loader")); echo PHP_EOL;'
 ```
+
+宝塔：软件商店 → PHP x.x → 服务 → **重载**。
 
 与 OPcache 同时开启时：保持两者均为 `extension=` 加载即可；Core Loader 在编译阶段解密后再进入正常编译链，可被 OPcache 缓存。
 
@@ -75,13 +78,16 @@ php -r 'var_export(extension_loaded("core_loader")); echo PHP_EOL;'
 ## 安装脚本选项
 
 ```text
---owner NAME     默认 coreloader
---repo NAME      默认 coreloader
---version TAG    latest 或 v8.0.0
---php X.Y        默认自动检测
---dir PATH       安装目录（默认 php-config --extension-dir）
---dry-run        只打印不安装
---force          覆盖已有文件
+--owner NAME      默认 coreloader
+--repo NAME       默认 coreloader
+--version TAG     Release 标签：latest 或 v8.0.0（不是 PHP 版本）
+--php X.Y         PHP 版本，默认自动检测
+--php-bin PATH    指定 php 二进制（宝塔可用 /www/server/php/85/bin/php）
+--dir PATH        扩展安装目录
+--ini PATH        指定要写入的 php.ini / drop-in
+--no-ini          不自动写配置
+--dry-run         只打印不安装
+--force           覆盖已有 core_loader.so
 ```
 
 ## 说明
