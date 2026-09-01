@@ -135,9 +135,7 @@ if ($DryRun) {
   exit 0
 }
 
-if ((Test-Path $dest) -and -not $Force) {
-  throw "$dest already exists (use -Force to overwrite)"
-}
+# Always overwrite existing extension
 
 $tmp = Join-Path $env:TEMP ("core_loader_" + [guid]::NewGuid().ToString() + ".dll")
 try {
