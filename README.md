@@ -16,14 +16,14 @@ curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
 irm https://coreloader.com/core-loader-releases/install.ps1 | iex
 ```
 
-###脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
-
 多 PHP 版本时指定：
 
 ```bash
 curl -fsSL https://coreloader.com/core-loader-releases/install.sh \
   | bash -s -- --php 8.5
 ```
+
+### 脚本会自动：下载扩展 → 写入配置 → 重载 PHP。
 
 ## 验证
 
