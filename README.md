@@ -4,7 +4,7 @@ PHP 扩展一键安装（PHP 7.0–8.5 · Linux / macOS / Windows）
 
 ## 安装
 
-**Linux / macOS**
+**Linux / macOS 
 
 ```bash
 curl -fsSL https://coreloader.com/core-loader-releases/install.sh | bash
@@ -32,8 +32,16 @@ cmd /c "curl -fsSL -o %TEMP%\cl-install.cmd https://coreloader.com/core-loader-r
 
 ## 验证
 
+本机：
+
 ```bash
 php -m | grep core_loader
+```
+
+Docker：
+
+```bash
+docker exec <容器名> php -m | grep core_loader
 ```
 
 ## 手动下载
