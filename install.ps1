@@ -25,6 +25,39 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Avoid stair-step output under cmd.exe + Windows PowerShell 5.x (LF without CR).
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+  function Write-Host {
+    [CmdletBinding()]
+    param(
+      [Parameter(Position = 0, ValueFromPipeline = $true)]
+      [object]$Object,
+      [ConsoleColor]$ForegroundColor,
+      [ConsoleColor]$BackgroundColor,
+      [switch]$NoNewline
+    )
+    process {
+      $text = if ($null -eq $Object) { "" } else { [string]$Object }
+      $oldFg = $null
+      $oldBg = $null
+      try {
+        if ($PSBoundParameters.ContainsKey("ForegroundColor")) {
+          $oldFg = [Console]::ForegroundColor
+          [Console]::ForegroundColor = $ForegroundColor
+        }
+        if ($PSBoundParameters.ContainsKey("BackgroundColor")) {
+          $oldBg = [Console]::BackgroundColor
+          [Console]::BackgroundColor = $BackgroundColor
+        }
+        if ($NoNewline) { [Console]::Write($text) } else { [Console]::WriteLine($text) }
+      } finally {
+        if ($null -ne $oldFg) { [Console]::ForegroundColor = $oldFg }
+        if ($null -ne $oldBg) { [Console]::BackgroundColor = $oldBg }
+      }
+    }
+  }
+}
+
 if ([string]::IsNullOrWhiteSpace($DownloadUrl)) {
   $DownloadUrl = "$($BaseUrl.TrimEnd('/'))/download"
 }
@@ -41,10 +74,112 @@ if ([string]::IsNullOrWhiteSpace($FallbackUrl)) {
   }
 }
 
+function Invoke-PhpProbe([string]$Bin, [string[]]$PhpArgs) {
+  # Use -n so a half-configured php.ini (extension line before DLL exists) does not break install.
+  $argLine = "-n " + (($PhpArgs | ForEach-Object {
+    if ($_ -match '\s') { '"' + ($_ -replace '"', '""') + '"' } else { $_ }
+  }) -join ' ')
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $Bin
+  $psi.Arguments = $argLine
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $psi
+  [void]$proc.Start()
+  $stdout = $proc.StandardOutput.ReadToEnd()
+  [void]$proc.StandardError.ReadToEnd()
+  $proc.WaitForExit()
+  return $stdout.Trim()
+}
+
 function Get-PhpVersionFromBin([string]$bin) {
-  $out = & $bin -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>$null
+  $out = Invoke-PhpProbe $bin @('-r', "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
   if (-not $out) { throw "php not found: $bin" }
   return $out.Trim()
+}
+
+function Add-PhpCandidate([System.Collections.Generic.HashSet[string]]$set, [string]$path) {
+  if ([string]::IsNullOrWhiteSpace($path)) { return }
+  [void]$set.Add($path.Trim().Trim('"').Trim("'"))
+}
+
+function Find-PhpBin([string]$WantVer) {
+  $candidates = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+  if ($env:CORELOADER_PHP_BIN) { Add-PhpCandidate $candidates $env:CORELOADER_PHP_BIN }
+
+  $cmd = Get-Command php -ErrorAction SilentlyContinue
+  if ($cmd) { Add-PhpCandidate $candidates $cmd.Source }
+
+  $compact = $null
+  if ($WantVer -match '^(\d+)\.(\d+)') {
+    $compact = "$($Matches[1])$($Matches[2])"
+  }
+
+  $panelPhpRoots = @(
+    'C:\BtSoft\php', 'D:\BtSoft\php', 'E:\BtSoft\php',
+    'C:\phpstudy_pro\Extensions\php',
+    'C:\Program Files\php', 'C:\php', 'D:\php'
+  )
+
+  foreach ($root in $panelPhpRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+
+    if ($compact) {
+      Add-PhpCandidate $candidates (Join-Path $root "$compact\php.exe")
+      Add-PhpCandidate $candidates (Join-Path $root "$WantVer\php.exe")
+    }
+
+    Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+      Add-PhpCandidate $candidates (Join-Path $_.FullName 'php.exe')
+    }
+  }
+
+  $matched = New-Object System.Collections.Generic.List[object]
+  foreach ($bin in $candidates) {
+    if (-not (Test-Path -LiteralPath $bin)) { continue }
+    try {
+      $ver = Invoke-PhpProbe $bin @('-r', "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+      if (-not $ver) { continue }
+      $ver = $ver.ToString().Trim()
+      if ($WantVer -and $ver -ne $WantVer) { continue }
+      if ($WantVer) { return $bin }
+      $matched.Add([pscustomobject]@{ Bin = $bin; Ver = $ver }) | Out-Null
+    } catch {}
+  }
+
+  if ($matched.Count -eq 0) { return $null }
+  return ($matched | Sort-Object { [version]$_.Ver } -Descending | Select-Object -First 1).Bin
+}
+
+function Resolve-PhpRuntime([string]$WantVer, [string]$ExplicitBin) {
+  if ($ExplicitBin) {
+    if (-not (Test-Path -LiteralPath $ExplicitBin)) {
+      throw "PHP binary not found: $ExplicitBin"
+    }
+    $ver = Get-PhpVersionFromBin $ExplicitBin
+    if ($WantVer -and $ver -ne $WantVer) {
+      $found = Find-PhpBin -WantVer $WantVer
+      if ($found) {
+        Write-Host "Note: using $found for PHP $WantVer (not $ExplicitBin)."
+        return @{ Bin = $found; Ver = $WantVer }
+      }
+      throw "PHP binary $ExplicitBin is version $ver, expected $WantVer. Install PHP $WantVer or run: dir /s /b C:\BtSoft\php\php.exe"
+    }
+    return @{ Bin = $ExplicitBin; Ver = $ver }
+  }
+
+  $found = Find-PhpBin -WantVer $WantVer
+  if (-not $found) {
+    $verHint = if ($WantVer) { " $WantVer" } else { "" }
+    throw "Could not find PHP${verHint}. Common paths: C:\BtSoft\php\85\php.exe (BtSoft), C:\phpstudy_pro\Extensions\php\*\php.exe. Pass -PhpBin 'C:\path\to\php.exe' or set CORELOADER_PHP_BIN."
+  }
+
+  $ver = if ($WantVer) { $WantVer } else { Get-PhpVersionFromBin $found }
+  return @{ Bin = $found; Ver = $ver }
 }
 
 function Get-WinArch {
@@ -58,20 +193,66 @@ function Normalize-IniPath([string]$p) {
 }
 
 function Get-ExtensionDir([string]$bin) {
-  if ($Dir) { return $Dir }
-  $ext = & $bin -r "echo ini_get('extension_dir');" 2>$null
-  if ($ext -and $ext.Trim() -ne "." -and $ext.Trim() -ne "") {
-    return $ext.Trim()
+  $phpHome = Split-Path -Parent $bin
+  $defaultExt = [System.IO.Path]::GetFullPath((Join-Path $phpHome 'ext'))
+  if ($Dir) {
+    $dirFull = if ([System.IO.Path]::IsPathRooted($Dir)) {
+      [System.IO.Path]::GetFullPath($Dir)
+    } else {
+      [System.IO.Path]::GetFullPath((Join-Path $phpHome $Dir))
+    }
+    if ($dirFull.StartsWith($phpHome, [StringComparison]::OrdinalIgnoreCase)) {
+      return $dirFull
+    }
+    Write-Host "  note: extension dir adjusted to $defaultExt"
+    return $defaultExt
   }
-  throw "Could not detect extension_dir; pass -Dir"
+
+  # BtSoft / panel: ext/ next to php.exe is the real directory.
+  if (Test-Path -LiteralPath $defaultExt) {
+    return $defaultExt
+  }
+
+  # Read extension_dir from php.ini on disk (avoid php -n default C:\php\ext).
+  $phpIni = Join-Path $phpHome 'php.ini'
+  if (Test-Path -LiteralPath $phpIni) {
+    $iniText = Get-Content -LiteralPath $phpIni -Raw -ErrorAction SilentlyContinue
+    if ($iniText -match '(?mim)^\s*extension_dir\s*=\s*"?([^"\r\n;]+)"?\s*') {
+      $ext = $Matches[1].Trim()
+      if ($ext -and $ext -ne '.' -and $ext -ne '') {
+        if (-not [System.IO.Path]::IsPathRooted($ext)) {
+          $ext = Join-Path $phpHome $ext
+        }
+        return [System.IO.Path]::GetFullPath($ext)
+      }
+    }
+  }
+
+  return $defaultExt
 }
 
 function Get-IniTargets([string]$bin) {
   if ($Ini) { return @((Normalize-IniPath $Ini)) }
-  $iniOut = & $bin --ini 2>$null | Out-String
+
+  $phpHome = Split-Path -Parent $bin
+  $phpIni = Join-Path $phpHome 'php.ini'
+  $cliIni = Join-Path $phpHome 'php-cli.ini'
+  $targets = New-Object System.Collections.Generic.List[string]
+
+  # BtSoft / panel layouts: php.ini sits next to php.exe; avoid `php --ini` during install
+  # when php.ini already references core_loader but the DLL is not in place yet.
+  if (Test-Path -LiteralPath $phpIni) {
+    $targets.Add($phpIni) | Out-Null
+    if (Test-Path -LiteralPath $cliIni) {
+      $targets.Add($cliIni) | Out-Null
+    }
+    return $targets.ToArray()
+  }
+
+  $iniOut = Invoke-PhpProbe $bin @('--ini')
   $loaded = $null
   $scan = $null
-  foreach ($line in ($iniOut -split "`n")) {
+  foreach ($line in ($iniOut -split "`r?`n")) {
     if ($line -match 'Loaded Configuration File:\s*(.+)$') {
       $loaded = Normalize-IniPath $Matches[1]
     }
@@ -157,73 +338,115 @@ function Download-Asset([string]$dest, [string[]]$urls) {
   throw "Download failed (primary + backup)"
 }
 
-function Restart-PhpRuntime([string]$phpVer) {
-  Write-Host "Reloading PHP runtime..."
-  $compact = ($phpVer -replace '\.', '')
-
-  try {
-    if (Get-Command iisreset -ErrorAction SilentlyContinue) {
-      & iisreset /noforce 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) {
-        Write-Host "  reloaded via iisreset"
-        return
-      }
-    }
-  } catch {}
-
-  try {
-    Import-Module WebAdministration -ErrorAction SilentlyContinue
-    if (Get-Command Restart-WebAppPool -ErrorAction SilentlyContinue) {
-      $ok = $false
-      Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue | ForEach-Object {
-        Restart-WebAppPool $_.Name -ErrorAction SilentlyContinue
-        $ok = $true
-      }
-      if ($ok) {
-        Write-Host "  restarted IIS app pools"
-        return
-      }
-    }
-  } catch {}
-
-  $serviceNames = @(
-    "php-fpm-$compact", "php-fpm$compact", "php$compact-fpm", "php$phpVer-fpm",
-    "php-cgi-$compact", "php-cgi", "php-fpm", "w3svc", "Apache2.4", "Apache2.2", "nginx"
-  )
-  foreach ($name in $serviceNames) {
-    $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-    if ($null -eq $svc) { continue }
+function Stop-PhpRuntimeForUpdate([string]$phpVer, [string]$destPath) {
+  Write-Host "Stopping PHP/IIS so extension can be updated..."
+  Get-Process -Name php-cgi, php -ErrorAction SilentlyContinue | ForEach-Object {
+    try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {}
+  }
+  Start-Sleep -Seconds 1
+  if (Test-Path -LiteralPath $destPath) {
     try {
-      Restart-Service -Name $name -Force -ErrorAction Stop
-      Write-Host "  restarted service $name"
-      return
+      if (Get-Command iisreset -ErrorAction SilentlyContinue) {
+        & iisreset /stop 2>$null | Out-Null
+        Start-Sleep -Seconds 2
+        Write-Host "  stopped IIS (iisreset /stop)"
+      }
     } catch {}
   }
+}
 
-  if (Get-Command docker -ErrorAction SilentlyContinue) {
-    $rows = docker ps --format "{{.ID}} {{.Names}} {{.Image}}" 2>$null
-    if ($rows) {
-      $matched = $rows | Where-Object { $_ -match 'php|fpm|1panel' -and $_ -match "$phpVer|$compact" }
-      if (-not $matched) {
-        $matched = $rows | Where-Object { $_ -match 'php.*fpm|fpm.*php|1panel.*php' }
+function Copy-ExtensionDll([string]$src, [string]$dest, [string]$phpVer) {
+  $attempts = 0
+  while ($attempts -lt 3) {
+    $attempts++
+    try {
+      Copy-Item -LiteralPath $src -Destination $dest -Force -ErrorAction Stop
+      return
+    } catch {
+      if ($attempts -ge 3) { throw }
+      Write-Host "  file locked: $dest"
+      Stop-PhpRuntimeForUpdate -phpVer $phpVer -destPath $dest
+    }
+  }
+}
+
+function Invoke-WithTimeout([string]$Label, [scriptblock]$Block, [int]$TimeoutSec = 10) {
+  Write-Host "  $Label..."
+  $job = Start-Job -ScriptBlock $Block
+  if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+    Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    Write-Host "  $Label done"
+    return $true
+  }
+  Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
+  Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+  Write-Host "  $Label timed out (continuing)"
+  return $false
+}
+
+function Write-BtSoftReloadHint([string]$phpVer, [string]$phpBin) {
+  Write-Host ""
+  Write-Host "Install finished. If the website still uses the old PHP config, restart manually:"
+  if ($phpBin -match '\\BtSoft\\php\\') {
+    Write-Host "  BtSoft panel -> Software Store -> PHP $phpVer -> Restart"
+    Write-Host "  (Avoid iisreset in remote panel sessions; it may disconnect the terminal.)"
+  } else {
+    Write-Host "  Run as Administrator: iisreset /restart"
+  }
+}
+
+function Restart-PhpRuntime([string]$phpVer, [string]$phpBin) {
+  Write-Host "Reloading PHP runtime (quick, non-blocking)..."
+  $isBtSoft = $phpBin -match '\\BtSoft\\php\\'
+  $actions = New-Object System.Collections.Generic.List[string]
+
+  $phpCgi = @(Get-Process -Name php-cgi -ErrorAction SilentlyContinue)
+  if ($phpCgi.Count -gt 0) {
+    $phpCgi | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    $actions.Add("stopped $($phpCgi.Count) php-cgi process(es)") | Out-Null
+  }
+
+  if (Invoke-WithTimeout "recycling IIS app pools" {
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
+    if (Get-Command Restart-WebAppPool -ErrorAction SilentlyContinue) {
+      Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue | ForEach-Object {
+        Restart-WebAppPool $_.Name -ErrorAction SilentlyContinue
       }
-      foreach ($row in $matched) {
-        $id = ($row -split '\s+')[0]
-        $name = ($row -split '\s+')[1]
-        try {
-          docker restart $id 2>$null | Out-Null
-          Write-Host "  restarted docker container $name"
-          return
-        } catch {}
+    }
+  } -TimeoutSec 12) {
+    $actions.Add("recycled IIS app pools") | Out-Null
+  }
+
+  if (-not $isBtSoft) {
+    $compact = ($phpVer -replace '\.', '')
+    foreach ($name in @("php-fpm-$compact", "php-cgi-$compact", "php-cgi", "Apache2.4", "nginx")) {
+      if (Invoke-WithTimeout "restarting service $name" { Restart-Service -Name $name -Force -ErrorAction Stop } -TimeoutSec 8) {
+        $actions.Add("restarted service $name") | Out-Null
+        break
       }
     }
   }
 
-  Write-Host "  warning: could not auto-reload PHP runtime; restart IIS/service/container manually if needed"
+  if ($env:CORELOADER_FORCE_RELOAD -eq '1') {
+    Write-Host "  starting iisreset /restart in background (CORELOADER_FORCE_RELOAD=1)..."
+    Start-Process -FilePath "iisreset.exe" -ArgumentList "/restart" -WindowStyle Hidden | Out-Null
+    $actions.Add("iisreset /restart (background)") | Out-Null
+  }
+
+  if ($actions.Count -gt 0) {
+    foreach ($a in $actions) { Write-Host "  $a" }
+  } else {
+    Write-Host "  cleared PHP worker processes; reload on next request"
+  }
+
+  Write-BtSoftReloadHint -phpVer $phpVer -phpBin $phpBin
 }
 
-if (-not $PhpBin) { $PhpBin = "php" }
-if (-not $Php) { $Php = Get-PhpVersionFromBin $PhpBin }
+$resolved = Resolve-PhpRuntime -WantVer $Php -ExplicitBin $PhpBin
+$PhpBin = $resolved.Bin
+$Php = $resolved.Ver
 
 $supported = @("7.0","7.1","7.2","7.3","7.4","8.0","8.1","8.2","8.3","8.4","8.5")
 if ($supported -notcontains $Php) {
@@ -290,7 +513,7 @@ try {
   if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   }
-  Copy-Item -Force $tmp $dest
+  Copy-ExtensionDll -src $tmp -dest $dest -phpVer $Php
 } catch {
   Write-Host "Install failed: $_"
   Write-Host "Run PowerShell as Administrator if permission denied."
@@ -309,7 +532,7 @@ if (-not $NoIni) {
 }
 
 if (-not $NoReload) {
-  Restart-PhpRuntime -phpVer $Php
+  Restart-PhpRuntime -phpVer $Php -phpBin $PhpBin
 }
 
 Write-Host ""
