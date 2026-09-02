@@ -1,6 +1,8 @@
 # Core Loader
 
-PHP 扩展一键安装（PHP 7.0–8.5 · Linux / macOS / Windows）
+PHP 扩展一键安装脚本（PHP 7.0–8.5 · Linux / macOS / Windows）
+
+技术文档：https://coreloader.com/docs
 
 ## 安装
 
